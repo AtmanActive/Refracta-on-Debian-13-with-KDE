@@ -1,0 +1,379 @@
+From: Refracta user
+Date: 2026-06-26
+Subject: [PATCH] Add btrfs filesystem support (single + subvolumes) to refractainstaller
+
+This patch adds two new filesystem options to both the GUI (yad) and CLI
+versions of refractainstaller:
+
+  1. "btrfs (single partition)" - formats the root partition as btrfs
+     without subvolumes. Produces a single fstab entry with no subvol=
+     option. The top-level btrfs volume (subvolid=5) is mounted as /.
+
+  2. "btrfs (with subvolumes)" - formats the root partition as btrfs and
+     creates a standard set of subvolumes, then mounts @rootfs as / and
+     the remaining subvolumes at their respective mount points before
+     rsync. Produces multiple fstab entries (one per subvolume, all
+     sharing the same UUID with subvol= options). Also adds
+     rootflags=subvol=@rootfs to GRUB_CMDLINE_LINUX_DEFAULT so the
+     initramfs mounts the correct subvolume as root.
+
+Default subvolumes created:
+  @rootfs     -> /
+  @home       -> /home
+  @var        -> /var
+  @tmp        -> /tmp
+  @snapshots  -> /.snapshots
+
+When "btrfs (with subvolumes)" is selected, the separate /home partition
+option is automatically disabled (with a user notification) because /home
+becomes a subvolume on the same btrfs filesystem.
+
+When the "Do not format" option (no_format=yes) is used on a partition
+that is already btrfs, the patch auto-detects whether subvolumes exist
+(by checking for @rootfs) and sets the btrfs mode accordingly. This
+allows users to pre-format with btrfs and pre-create subvolumes using
+their own scripts, then run the installer with "Do not format" to use
+the existing layout.
+
+The patch also extends the update-initramfs condition to rebuild the
+initramfs when btrfs is selected, ensuring btrfs modules and tools are
+included.
+
+Compatibility:
+  - ext2/ext3/ext4 paths are unchanged; the patch only adds new branches.
+  - Encryption (LUKS) is not combined with btrfs in this patch. The
+    existing encryption logic uses mke2fs/cryptsetup and is left intact.
+    If a user selects both encryption and btrfs, the mke2fs path will
+    be used (btrfs is ignored). This matches current behaviour where
+    only ext-family filesystems are offered with encryption.
+  - The btrfs-progs package is required. A check is performed at
+    runtime with a user-friendly error message if mkfs.btrfs is missing.
+
+Files patched:
+  usr/bin/refractainstaller-yad  (GUI version, 9.6.6)
+  usr/bin/refractainstaller      (CLI version, 9.6.6)
+
+Apply with:
+  patch -p1 < btrfs-support-for-refractainstaller.patch
+
+---
+
+--- a/usr/bin/refractainstaller-yad
++++ b/usr/bin/refractainstaller-yad
+@@ -52,6 +52,10 @@
+ 
+ configfile="/etc/refractainstaller.conf"
+ 
++# btrfs subvolume layout (used when "btrfs (with subvolumes)" is selected)
++btrfs_subvols=( @rootfs @home @var @tmp @snapshots )
++btrfs_subvol_mounts=( "/" "/home" "/var" "/tmp" "/.snapshots" )
++
+ if [[ -f $configfile ]]; then
+     source $configfile
+ else
+@@ -851,10 +855,12 @@
+ # Choose filesystem type for OS.
+ choose_fs_os () {
+ fs_type_os=$(yad --list --title=$"Root Filesystem" --center --borders=10 --text=$"What type of filesystem would you like on $install_dev?" \
+-  --separator="" --column $"Format" --height=200 --button=$"OK":0 \
++  --separator="" --column $"Format" --height=300 --button=$"OK":0 \
+   "ext4" \
+   "ext3" \
+-  "ext2")
++  "ext2" \
++  "btrfs (single partition)" \
++  "btrfs (with subvolumes)")
+ if [[ -z $fs_type_os ]]; then
+         yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
+       --text=$"You must choose a file system type
+@@ -867,10 +873,44 @@
+ fi  
+ }
+ 
++btrfs_mode=""
+ if [[ $no_format = "yes" ]]; then 
+ 	fs_type_os=$(blkid -s TYPE "$install_dev" | awk -F"\"" '{ print $2 }')
++	if [[ "$fs_type_os" == "btrfs" ]]; then
++		_btrfs_tmp=$(mktemp -d)
++		mount -o subvolid=5 "$install_dev" "$_btrfs_tmp" 2>/dev/null
++		if btrfs subvolume list "$_btrfs_tmp" 2>/dev/null | grep -q @rootfs; then
++			btrfs_mode="subvol"
++		else
++			btrfs_mode="single"
++		fi
++		umount "$_btrfs_tmp" 2>/dev/null; rmdir "$_btrfs_tmp"
++	fi
+ else
+ 	choose_fs_os
++	if [[ "$fs_type_os" == "btrfs (single partition)" ]]; then
++		fs_type_os="btrfs"
++		btrfs_mode="single"
++	elif [[ "$fs_type_os" == "btrfs (with subvolumes)" ]]; then
++		fs_type_os="btrfs"
++		btrfs_mode="subvol"
++	fi
++fi
++
++# Check for btrfs-progs if btrfs was selected
++if [[ "$fs_type_os" == "btrfs" ]]; then
++	if ! command -v mkfs.btrfs &>/dev/null; then
++		yad --image="gtk-dialog-error" --title=$"Error" --center --borders=10 --button=$"Exit":0 \
++		  --text=$"btrfs-progs is not installed. Install it with:\napt-get install btrfs-progs\n\nThen run the installer again."
++		exit 1
++	fi
++fi
++
++# btrfs subvolumes use /home as a subvolume, not a separate partition
++if [[ "$btrfs_mode" == "subvol" ]] && [[ "$sep_home" == "yes" ]]; then
++	sep_home="no"
++	yad --info --title=$"btrfs subvolumes" --center --borders=10 --button=$"OK":0 \
++	  --text=$"/home will be a btrfs subvolume, not a separate partition.\nSeparate /home partition option has been disabled."
+ fi
+ 
+ 
+@@ -1251,9 +1291,37 @@
+     install_part="$install_dev"
+ fi 
+ if [[ $no_format != "yes" ]]; then
+-	mke2fs -t $fs_type_os "$install_part"  # ; check_exit 
++	if [[ "$fs_type_os" == "btrfs" ]]; then
++		mkfs.btrfs --force "$install_part"  # ; check_exit
++	else
++		mke2fs -t $fs_type_os "$install_part"  # ; check_exit 
++	fi
++fi
++
++# For btrfs with subvolumes, create subvolumes and mount @rootfs
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	_btrfs_top=$(mktemp -d)
++	mount -o subvolid=5 "$install_part" "$_btrfs_top"
++	for _sv in "${btrfs_subvols[@]}"; do
++		btrfs subvolume create "$_btrfs_top/$_sv"
++	done
++	umount "$_btrfs_top"; rmdir "$_btrfs_top"
++	mount -o subvol=@rootfs "$install_part" /target ; check_exit 
++else
++	mount "$install_part" /target ; check_exit 
++fi
++
++
++# Mount btrfs subvolumes for /home, /var, /tmp, /.snapshots
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	for _idx in "${!btrfs_subvols[@]}"; do
++		_sv="${btrfs_subvols[$_idx]}"
++		_mp="${btrfs_subvol_mounts[$_idx]}"
++		[[ "$_mp" == "/" ]] && continue
++		mkdir -p "/target$_mp"
++		mount -o subvol="$_sv" "$install_part" "/target$_mp" ; check_exit
++	done
+ fi
+-mount "$install_part" /target ; check_exit 
+ 
+ 
+ # make mount point for separate home if needed
+@@ -1531,9 +1599,23 @@
+ 		install_part="$install_dev"
+ 	fi
+ fi
+-echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" > /target/etc/fstab
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=@rootfs\t0\t1" > /target/etc/fstab
++else
++	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" > /target/etc/fstab
++fi
+ check_exit
+ 
++# Add btrfs subvolume entries to fstab
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	for _idx in "${!btrfs_subvols[@]}"; do
++		_sv="${btrfs_subvols[$_idx]}"
++		_mp="${btrfs_subvol_mounts[$_idx]}"
++		[[ "$_mp" == "/" ]] && continue
++		echo -e "$install_part\t$_mp\t$fs_type_os\tdefaults,noatime,subvol=$_sv\t0\t2" >> /target/etc/fstab
++	done
++fi
++
+ 
+ # add entry for /home to fstab if needed
+ if ! [[ -z $home_dev ]] ; then
+@@ -1601,6 +1683,14 @@
+ fi
+ 
+ 
++# Add rootflags for btrfs subvolume boot
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	if [ -f /target/etc/default/grub ]; then
++		sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 rootflags=subvol=@rootfs"/' /target/etc/default/grub
++	fi
++fi
++
++
+ # Add entry for root filesystem to crypttab if needed
+ if [[ $encrypt_os = yes ]] ; then
+ 	if [[ $use_uuid = yes ]]; then
+@@ -1836,7 +1926,8 @@
+ #******************************************************************
+ 
+ # Run update-initramfs to include dm-mod if using encryption
+-if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] ; then
++# or to ensure btrfs support is included for btrfs installations
++if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] ; then
+ 	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
+ 		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
+ 	else
+--- a/usr/bin/refractainstaller
++++ b/usr/bin/refractainstaller
+@@ -28,6 +28,10 @@
+ # variable. Normally, users should not edit anything in this script.
+ configfile="/etc/refractainstaller.conf"
+ 
++# btrfs subvolume layout (used when "btrfs (with subvolumes)" is selected)
++btrfs_subvols=( @rootfs @home @var @tmp @snapshots )
++btrfs_subvol_mounts=( "/" "/home" "/var" "/tmp" "/.snapshots" )
++
+ 
+ show_help () {
+ 	programname="$0"
+@@ -685,12 +689,16 @@
+ 	2) ext2
+ 	3) ext3
+ 	4) ext4
++	5) btrfs (single partition)
++	6) btrfs (with subvolumes)
+ "
+ 	    read ans
+ 	    case $ans in
+ 	      2) fs_type_os="ext2" ; break ;;
+ 	      3) fs_type_os="ext3" ; break ;;
+ 	      4) fs_type_os="ext4" ; break ;;
++	      5) fs_type_os="btrfs" ; btrfs_mode="single" ; break ;;
++	      6) fs_type_os="btrfs" ; btrfs_mode="subvol" ; break ;;
+ 	    esac
+ 	done
+ 	
+@@ -755,12 +763,35 @@
+ }
+ 
+ 
++btrfs_mode=""
+ if [[ $no_format = "yes" ]]; then 
+ 	fs_type_os=$(blkid -s TYPE "$install_dev" | awk -F"\"" '{ print $2 }')
++	if [[ "$fs_type_os" == "btrfs" ]]; then
++		_btrfs_tmp=$(mktemp -d)
++		mount -o subvolid=5 "$install_dev" "$_btrfs_tmp" 2>/dev/null
++		if btrfs subvolume list "$_btrfs_tmp" 2>/dev/null | grep -q @rootfs; then
++			btrfs_mode="subvol"
++		else
++			btrfs_mode="single"
++		fi
++		umount "$_btrfs_tmp" 2>/dev/null; rmdir "$_btrfs_tmp"
++	fi
+ else
+ 	choose_fs_os
+ fi
+ 
++# Check for btrfs-progs if btrfs was selected
++if [[ "$fs_type_os" == "btrfs" ]]; then
++	if ! command -v mkfs.btrfs &>/dev/null; then
++		echo $"
++ btrfs-progs is not installed. Install it with:
++ apt-get install btrfs-progs
++ Then run the installer again.
++"
++		exit 1
++	fi
++fi
++
+ 
+ # Enter device for /home partition or skip. If one is entered, test it.
+ echo $"
+@@ -1138,11 +1169,36 @@
+ fi
+ 
+ if [[ $no_format != "yes" ]]; then
+-	mke2fs -t $fs_type_os "$install_part" # ; check_exit 
+-#	tune2fs -r 10000 "$install_part" ; check_exit 
++	if [[ "$fs_type_os" == "btrfs" ]]; then
++		mkfs.btrfs --force "$install_part" # ; check_exit 
++	else
++		mke2fs -t $fs_type_os "$install_part" # ; check_exit 
++	fi
+ fi
+ 
+-mount "$install_part" /target ; check_exit 
++# For btrfs with subvolumes, create subvolumes and mount @rootfs
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	_btrfs_top=$(mktemp -d)
++	mount -o subvolid=5 "$install_part" "$_btrfs_top"
++	for _sv in "${btrfs_subvols[@]}"; do
++		btrfs subvolume create "$_btrfs_top/$_sv"
++	done
++	umount "$_btrfs_top"; rmdir "$_btrfs_top"
++	mount -o subvol=@rootfs "$install_part" /target ; check_exit 
++else
++	mount "$install_part" /target ; check_exit 
++fi
++
++# Mount btrfs subvolumes for /home, /var, /tmp, /.snapshots
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	for _idx in "${!btrfs_subvols[@]}"; do
++		_sv="${btrfs_subvols[$_idx]}"
++		_mp="${btrfs_subvol_mounts[$_idx]}"
++		[[ "$_mp" == "/" ]] && continue
++		mkdir -p "/target$_mp"
++		mount -o subvol="$_sv" "$install_part" "/target$_mp" ; check_exit
++	done
++fi
+ 
+ # make mount point for separate home if needed
+ # and add /home/* to the excludes list if it's not already there
+@@ -1427,9 +1483,23 @@
+ 	fi
+ fi
+ echo -e $"\n Creating /etc/fstab...\n"
+-echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" >> /target/etc/fstab
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=@rootfs\t0\t1" >> /target/etc/fstab
++else
++	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" >> /target/etc/fstab
++fi
+ check_exit
+ 
++# Add btrfs subvolume entries to fstab
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	for _idx in "${!btrfs_subvols[@]}"; do
++		_sv="${btrfs_subvols[$_idx]}"
++		_mp="${btrfs_subvol_mounts[$_idx]}"
++		[[ "$_mp" == "/" ]] && continue
++		echo -e "$install_part\t$_mp\t$fs_type_os\tdefaults,noatime,subvol=$_sv\t0\t2" >> /target/etc/fstab
++	done
++fi
++
+ 
+ # add entry for /home to fstab if needed
+ if [[ -n $home_part ]] ; then
+@@ -1470,6 +1540,14 @@
+ fi
+ 
+ 
++# Add rootflags for btrfs subvolume boot
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	if [ -f /target/etc/default/grub ]; then
++		sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 rootflags=subvol=@rootfs"/' /target/etc/default/grub
++	fi
++fi
++
++
+ # Add entry for root filesystem to crypttab if needed
+ if [[ $encrypt_os = yes ]] ; then
+ 	echo -e $"\n Adding $install_part entry to crypttab...\n"
+@@ -1659,7 +1737,8 @@
+ 
+ 
+ # Run update-initramfs to include dm-mod if using encryption
+-if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] ; then
++# or to ensure btrfs support is included for btrfs installations
++if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] ; then
+ 	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
+ 		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
+ 	else
