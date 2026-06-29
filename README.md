@@ -46,7 +46,7 @@ A standard unified diff that patches both the GUI and CLI versions of refractain
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 ```
 
-The patch has evolved through six versions:
+The patch has evolved through seven versions:
 
 #### v1 — btrfs filesystem support
 
@@ -161,7 +161,21 @@ fi
 
 **RAM-sized swapfile:**
 
-The stock swapfile default is 256 MiB (`swapfile_count=262144`), which rounds to **0 GiB** in `free -g` and is useless on a desktop. The swapfile is now sized to **match the target machine's RAM** (rounded up to a whole GiB), auto-detected from `/proc/meminfo` at install time — large enough to be useful and to support hibernation. This applies to **every filesystem** (ext2/3/4 and btrfs), not just btrfs; it falls back to the configured size if RAM can't be read. On btrfs the swapfile is additionally made NoCoW (see above). (`chmod` now precedes `mkswap`, dropping the harmless "insecure permissions" warning.) Note: actually hibernating to the swapfile additionally requires a `resume=`/`resume_offset=` kernel parameter, which this patch does not configure.
+The stock swapfile default is 256 MiB (`swapfile_count=262144`), which rounds to **0 GiB** in `free -g` and is useless on a desktop. The swapfile is now sized to **match the target machine's RAM** (rounded up to a whole GiB), auto-detected from `/proc/meminfo` at install time — large enough to be useful and to support hibernation. This applies to **every filesystem** (ext2/3/4 and btrfs), not just btrfs; it falls back to the configured size if RAM can't be read. On btrfs the swapfile is additionally made NoCoW (see above). (`chmod` now precedes `mkswap`, dropping the harmless "insecure permissions" warning.) Actually hibernating to the swapfile also needs `resume=`/`resume_offset=` kernel parameters — wired up in v7 below.
+
+#### v7 — hibernation (resume from swap), all scenarios
+
+v6 sized swap large enough for hibernation; v7 configures the system to actually resume from it. `configure_resume()` handles every swap scenario:
+
+| Scenario | `resume=` | `resume_offset=` |
+|---|---|---|
+| swapfile on btrfs (incl. `@swap` subvolume) | UUID of the btrfs filesystem | `btrfs inspect-internal map-swapfile -r` |
+| swapfile on ext2/3/4 | UUID of the root filesystem | first physical block from `filefrag` |
+| existing swap partition | UUID of the swap partition | (none) |
+
+For each, it writes `RESUME=UUID=<dev>` to `/etc/initramfs-tools/conf.d/resume` and appends `resume=UUID=<dev> [resume_offset=N]` to `GRUB_CMDLINE_LINUX_DEFAULT`, then `update-grub` + `update-initramfs` pick them up (the initramfs rebuild now also triggers when resume is configured, so it works on plain ext4 installs too). A swapfile install only enables resume if the offset was successfully obtained, and the whole thing is **skipped for encrypted root** (resuming from encrypted swap needs additional setup).
+
+> **VirtualBox caveat:** S4/hibernation generally does **not** work under VirtualBox (its EFI/ACPI doesn't reliably trigger the kernel's resume). Everything is configured correctly, but test actual hibernate/restore on **bare metal**.
 
 ### `disk_setup_for_btrfs_desktop_plain.sh` / `disk_setup_for_btrfs_desktop_subvolumes.sh`
 

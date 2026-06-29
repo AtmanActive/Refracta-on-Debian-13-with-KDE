@@ -1,11 +1,12 @@
 From: Refracta user
 Date: 2026-06-29
-Subject: [PATCH v6] btrfs layout learning + NoCoW/RAM-sized swap + EFI /boot fix
+Subject: [PATCH v7] btrfs layout learning + RAM swap + hibernation + EFI fixes
 
 This patch adds btrfs filesystem support to both the GUI (yad) and CLI
 versions of refractainstaller, makes the installer LEARN the btrfs subvolume
-layout from the disk, fixes EFI partition mounting and grub installation,
-and mirrors the installer log to the target disk.
+layout from the disk, sizes swap to RAM and configures hibernation, fixes EFI
+partition mounting and grub installation, and mirrors the installer log to the
+target disk.
 
 Filesystem options added:
 
@@ -24,20 +25,33 @@ Learning the layout from the disk:
   discovers existing subvolumes via `btrfs subvolume list` and guesses
   mountpoints by convention (btrfs_guess_mount). Entries are sorted by
   mountpoint depth so parents mount before children, and the root subvolume
-  (whichever maps to "/") is derived rather than assumed to be "@rootfs". Any
-  subvolume scheme therefore works with no edits to the installer.
+  (whichever maps to "/") is derived rather than assumed to be "@rootfs".
 
 Swapfile (RAM-sized everywhere, NoCoW on btrfs):
 
   The swapfile is sized to match the target's RAM (rounded up to a whole GiB),
   auto-detected from /proc/meminfo at install time, for EVERY filesystem -
-  instead of the stock 256 MiB default (which rounds to 0 GiB in `free -g`
-  and is useless). It falls back to the configured size if RAM can't be read.
-  On btrfs the swapfile is additionally made NoCoW (chattr +C on an empty file
-  before writing) or swapon would fail ("swapfile has holes"); when the layout
-  has a dedicated @swap subvolume the swapfile is created inside it (e.g.
-  /swap/swapfile) and the fstab swap entry points at the real path. chmod
-  precedes mkswap to avoid the "insecure permissions" warning.
+  instead of the stock 256 MiB default (which rounds to 0 GiB in `free -g`).
+  It falls back to the configured size if RAM can't be read. On btrfs the
+  swapfile is additionally made NoCoW (chattr +C on an empty file before
+  writing); when the layout has a dedicated @swap subvolume the swapfile is
+  created inside it (e.g. /swap/swapfile). chmod precedes mkswap.
+
+Hibernation (resume from swap), all scenarios:
+
+  configure_resume() sets the installed system up to resume from hibernation
+  for every swap scenario:
+    - swapfile on btrfs (incl. @swap subvolume): resume_offset is computed with
+      `btrfs inspect-internal map-swapfile -r`;
+    - swapfile on ext2/3/4: resume_offset is computed from `filefrag`;
+    - an existing swap partition: resume by UUID, no offset.
+  It writes RESUME=UUID=<dev> to /etc/initramfs-tools/conf.d/resume and appends
+  resume=UUID=<dev> [resume_offset=N] to GRUB_CMDLINE_LINUX_DEFAULT, then
+  update-grub + update-initramfs (the initramfs rebuild now also triggers when
+  resume is configured). For a swapfile, resume is only enabled if the offset
+  was obtained. Skipped for encrypted root (resuming from encrypted swap needs
+  extra setup). Note: hibernation generally does NOT work under VirtualBox;
+  test on bare metal.
 
 EFI boot fixes:
 
@@ -58,11 +72,15 @@ Dual logging:
     real time; clean_log() (GUI) sanitizes passwords in both copies; a final
     sync runs at the end of the install.
 
+Changes from v6:
+  - Added configure_resume(): hibernation resume= / resume_offset= +
+    initramfs RESUME for swapfile (btrfs and ext) and swap-partition installs;
+    update-initramfs now also runs when resume is configured.
+
 Changes from v5:
-  - install_grub(): findmnt guard around the chroot /boot remount, fixing
-    grub-install "cannot find EFI directory" on EFI + separate /boot installs.
-  - Swapfile is sized to match RAM (rounded up to a whole GiB) on ALL
-    filesystems, not just btrfs; chmod precedes mkswap.
+  - install_grub(): findmnt guard around the chroot /boot remount.
+  - Swapfile sized to match RAM (whole GiB) on ALL filesystems; chmod before
+    mkswap.
 
 Changes from v4:
   - load_btrfs_layout() + btrfs_guess_mount(): layout learned from an on-disk
@@ -71,8 +89,9 @@ Changes from v4:
   - btrfs swapfile created NoCoW and routed into @swap when present.
 
 Compatibility:
-  - ext2/ext3/ext4 paths gain RAM-sized swap; otherwise unchanged.
-  - Encryption (LUKS) is not combined with btrfs in this patch.
+  - ext2/ext3/ext4 paths gain RAM-sized swap + hibernation; otherwise unchanged.
+  - Encryption (LUKS) is not combined with btrfs, and hibernation is skipped
+    for encrypted root.
   - btrfs-progs is required; checked at runtime with a friendly error.
 
 Files patched:
@@ -290,7 +309,7 @@ Apply with:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +1493,58 @@
+@@ -1333,14 +1493,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -349,10 +368,22 @@ Apply with:
 -	chmod 600 /target/swapfile
 +	chmod 600 "$swapfile_target"
 +	mkswap "$swapfile_target" ; check_exit
++	# Hibernation (v7): the image lives in this swapfile, on the root filesystem
++	# ($install_dev). Record the resume device UUID + the swapfile's offset.
++	# Skipped for encrypted root (resuming from encrypted swap needs more setup).
++	if [[ "$encrypt_os" != "yes" ]]; then
++		if [[ "$fs_type_os" == "btrfs" ]]; then
++			resume_offset=$(btrfs inspect-internal map-swapfile -r "$swapfile_target" 2>/dev/null)
++		else
++			resume_offset=$(filefrag -v "$swapfile_target" 2>/dev/null | awk '$1=="0:"{o=$4; sub(/\.\./,"",o); print o; exit}')
++		fi
++		# Only enable resume if we actually obtained the swapfile's offset.
++		[[ -n "$resume_offset" ]] && resume_uuid=$(blkid -s UUID -o value "$install_dev" 2>/dev/null)
++	fi
  fi
  
  
-@@ -1531,9 +1735,23 @@
+@@ -1531,9 +1747,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -377,7 +408,12 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1597,7 +1815,7 @@
+@@ -1594,10 +1824,12 @@
+ 	else
+ 		swap_part="$swap_dev"
+ 	fi
++	# Hibernation (v7): resume from this swap partition (no offset needed).
++	resume_uuid=$(/sbin/blkid -s UUID -o value "$swap_dev" 2>/dev/null)
      echo -e $"\n Adding swap entry to fstab...\n"
      echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
  else
@@ -386,7 +422,7 @@ Apply with:
  fi
  
  
-@@ -1674,13 +1892,28 @@
+@@ -1674,13 +1906,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -418,11 +454,42 @@ Apply with:
  fi
  
  
-@@ -1694,9 +1927,27 @@
- # Setup GRUB 
+@@ -1690,13 +1937,57 @@
+ 
+ 
+  
++# configure_resume UUID [OFFSET]
++#   Configure the installed system to resume from hibernation. UUID is the block
++#   device that holds the swap: the filesystem device for a swapfile, or the swap
++#   partition itself. OFFSET is the swapfile's resume offset (empty for a swap
++#   partition). Tells the initramfs which device to resume from and adds
++#   resume=/resume_offset= to the kernel command line via GRUB. No-op if no swap.
++configure_resume () {
++	local _uuid="$1" _off="$2" _params _grub="/target/etc/default/grub"
++	[[ -z "$_uuid" ]] && return 0
++	_params="resume=UUID=$_uuid"
++	[[ -n "$_off" ]] && _params="$_params resume_offset=$_off"
++	mkdir -p /target/etc/initramfs-tools/conf.d
++	echo "RESUME=UUID=$_uuid" > /target/etc/initramfs-tools/conf.d/resume
++	if [[ -f "$_grub" ]] && ! grep -q 'resume=UUID=' "$_grub" ; then
++		if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$_grub" ; then
++			sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 $_params\"|" "$_grub"
++		else
++			echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$_params\"" >> "$_grub"
++		fi
++	fi
++}
++
++
+ install_grub () {
+-# Setup GRUB 
++# Setup GRUB
  echo $"Setting up grub bootloader.. Please wait.."
  
 -# If /boot is separate partition, need to mount it in chroot for grub
++# Configure hibernation resume (no-op if there is no swap / encrypted root).
++configure_resume "$resume_uuid" "$resume_offset"
++
 +# If /boot is separate partition, mount it in the chroot for grub — but only if
 +# it isn't already mounted. With EFI + a separate /boot, the ESP-setup phase
 +# already mounts $boot_dev at /target/boot (with the ESP under it at
@@ -448,17 +515,17 @@ Apply with:
  fi
  
  
-@@ -1836,7 +2087,8 @@
+@@ -1836,7 +2127,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
 -if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] ; then
 +# or to ensure btrfs support is included for btrfs installations
-+if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] ; then
++if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] || [[ -n "$resume_uuid" ]] ; then
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -2058,10 +2310,12 @@
+@@ -2058,10 +2350,12 @@
  	# clear the log of plain-text passwords
  	if [ -n "$newpass" ]; then
  		sed -i "s|$newpass|\*\*\*\*|"g $error_log
@@ -471,7 +538,7 @@ Apply with:
  	fi
  	newpass=""
  	confirm_newpass=""
-@@ -2166,6 +2420,14 @@
+@@ -2166,6 +2460,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
@@ -684,7 +751,7 @@ Apply with:
  
  # make mount point for separate home if needed
  # and add /home/* to the excludes list if it's not already there
-@@ -1222,14 +1369,59 @@
+@@ -1222,14 +1369,71 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -744,10 +811,22 @@ Apply with:
 +	dd if=/dev/zero of="$swapfile_target" bs="$swap_bs" count="$swap_count" ; check_exit
 +	chmod 600 "$swapfile_target"
 +	mkswap "$swapfile_target" ; check_exit
++	# Hibernation (v7): the image lives in this swapfile, on the root filesystem
++	# ($install_dev). Record the resume device UUID + the swapfile's offset.
++	# Skipped for encrypted root (resuming from encrypted swap needs more setup).
++	if [[ "$encrypt_os" != "yes" ]]; then
++		if [[ "$fs_type_os" == "btrfs" ]]; then
++			resume_offset=$(btrfs inspect-internal map-swapfile -r "$swapfile_target" 2>/dev/null)
++		else
++			resume_offset=$(filefrag -v "$swapfile_target" 2>/dev/null | awk '$1=="0:"{o=$4; sub(/\.\./,"",o); print o; exit}')
++		fi
++		# Only enable resume if we actually obtained the swapfile's offset.
++		[[ -n "$resume_offset" ]] && resume_uuid=$(blkid -s UUID -o value "$install_dev" 2>/dev/null)
++	fi
  fi
  
  # Disallow mounting of all fixed drives with pmount
-@@ -1427,9 +1619,23 @@
+@@ -1427,9 +1631,23 @@
  	fi
  fi
  echo -e $"\n Creating /etc/fstab...\n"
@@ -772,7 +851,12 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if [[ -n $home_part ]] ; then
-@@ -1466,7 +1672,7 @@
+@@ -1463,10 +1681,12 @@
+ 	else
+ 		swap_part="$swap_dev"
+ 	fi
++	# Hibernation (v7): resume from this swap partition (no offset needed).
++	resume_uuid=$(/sbin/blkid -s UUID -o value "$swap_dev" 2>/dev/null)
  	echo -e $"\n Adding swap entry to fstab...\n"
  	echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
  else
@@ -781,7 +865,7 @@ Apply with:
  fi
  
  
-@@ -1524,9 +1730,17 @@
+@@ -1524,9 +1744,17 @@
  mount --bind /proc/ /target/proc/ ; check_exit 
  mount --bind /sys/ /target/sys/ ; check_exit 
  
@@ -801,7 +885,7 @@ Apply with:
  fi
  
  # This test is not complete and should probably be done earlier. grub_dev="efi" above
-@@ -1543,8 +1757,24 @@
+@@ -1543,15 +1771,68 @@
  	fi
      echo -e $"\n Adding esp entry to fstab...\n"
      echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
@@ -828,10 +912,38 @@ Apply with:
  fi
  
  
-@@ -1552,6 +1782,16 @@
- # Setup GRUB 
++# configure_resume UUID [OFFSET]
++#   Configure the installed system to resume from hibernation. UUID is the block
++#   device that holds the swap: the filesystem device for a swapfile, or the swap
++#   partition itself. OFFSET is the swapfile's resume offset (empty for a swap
++#   partition). Tells the initramfs which device to resume from and adds
++#   resume=/resume_offset= to the kernel command line via GRUB. No-op if no swap.
++configure_resume () {
++	local _uuid="$1" _off="$2" _params _grub="/target/etc/default/grub"
++	[[ -z "$_uuid" ]] && return 0
++	_params="resume=UUID=$_uuid"
++	[[ -n "$_off" ]] && _params="$_params resume_offset=$_off"
++	mkdir -p /target/etc/initramfs-tools/conf.d
++	echo "RESUME=UUID=$_uuid" > /target/etc/initramfs-tools/conf.d/resume
++	if [[ -f "$_grub" ]] && ! grep -q 'resume=UUID=' "$_grub" ; then
++		if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$_grub" ; then
++			sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 $_params\"|" "$_grub"
++		else
++			echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$_params\"" >> "$_grub"
++		fi
++	fi
++	echo -e $"\n Hibernation: resume=UUID=$_uuid ${_off:+resume_offset=$_off}\n"
++}
++
++
+ install_grub () {
+-# Setup GRUB 
++# Setup GRUB
  echo -e $"\n Setting up grub bootloader.. Please wait..\n"
  
++# Configure hibernation resume (no-op if there is no swap / encrypted root).
++configure_resume "$resume_uuid" "$resume_offset"
++
 +# Verify ESP is mounted for EFI install before running grub-install
 +if [[ $grub_dev = "efi" ]] ; then
 +	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
@@ -845,17 +957,20 @@ Apply with:
  
  
  #grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
-@@ -1659,7 +1899,8 @@
+@@ -1658,8 +1939,10 @@
+ done
  
  
- # Run update-initramfs to include dm-mod if using encryption
+-# Run update-initramfs to include dm-mod if using encryption
 -if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] ; then
-+# or to ensure btrfs support is included for btrfs installations
-+if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] ; then
++# Run update-initramfs to include dm-mod if using encryption,
++# to ensure btrfs support is included for btrfs installations,
++# or to embed the hibernation resume device (conf.d/resume).
++if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] || [[ -n "$resume_uuid" ]] ; then
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1918,6 +2159,14 @@
+@@ -1918,6 +2201,14 @@
  fi
  
  
