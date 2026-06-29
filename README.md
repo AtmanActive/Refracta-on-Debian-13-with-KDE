@@ -46,7 +46,7 @@ A standard unified diff that patches both the GUI and CLI versions of refractain
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 ```
 
-The patch has evolved through five versions:
+The patch has evolved through six versions:
 
 #### v1 — btrfs filesystem support
 
@@ -140,6 +140,28 @@ A btrfs swapfile must be NoCoW or `swapon` fails with "swapfile has holes". The 
 
 - creates the swapfile with `chattr +C` on an empty file **before** writing any data, for both plain btrfs and subvolume layouts;
 - when the layout has a dedicated `@swap` subvolume, creates the swapfile **inside it** (e.g. `/swap/swapfile`), keeping it out of root snapshots, and points the fstab swap entry at the real path.
+
+#### v6 — EFI + separate `/boot` grub fix + RAM-sized swap
+
+Found during a real "Do not format" btrfs-subvolumes install (which otherwise verified perfectly — manifest learning, all 8 subvolumes mounted, fstab, NoCoW swapfile).
+
+**`grub-install: cannot find EFI directory` (EFI + separate `/boot`):**
+
+With an EFI install that uses a separate `/boot` partition, the ESP-setup phase mounts `$boot_dev` at `/target/boot` and then the ESP at `/target/boot/efi` (a child mount under `/boot`). `install_grub()` then ran `chroot /target mount $boot_dev /boot` **again**, stacking a second `/boot` mount that **shadowed** the ESP — so inside the chroot `/boot/efi` was an empty dir on the fresh `/boot` partition, not the FAT ESP, and `grub-install` failed. This is a pre-existing upstream bug (not btrfs-related); our earlier `|| true` made the remount non-fatal but didn't stop the shadowing.
+
+Fix: a `findmnt /target/boot` guard skips the redundant chroot remount when `/boot` is already mounted (the EFI path), while still mounting it for the BIOS / no-ESP path:
+
+```bash
+if [[ -n $boot_dev ]] ; then
+    if ! findmnt /target/boot >/dev/null 2>&1 ; then
+        chroot /target mount $boot_dev /boot 2>/dev/null || true
+    fi
+fi
+```
+
+**RAM-sized swapfile:**
+
+The stock swapfile default is 256 MiB (`swapfile_count=262144`), which rounds to **0 GiB** in `free -g` and is useless on a desktop. The swapfile is now sized to **match the target machine's RAM** (rounded up to a whole GiB), auto-detected from `/proc/meminfo` at install time — large enough to be useful and to support hibernation. This applies to **every filesystem** (ext2/3/4 and btrfs), not just btrfs; it falls back to the configured size if RAM can't be read. On btrfs the swapfile is additionally made NoCoW (see above). (`chmod` now precedes `mkswap`, dropping the harmless "insecure permissions" warning.) Note: actually hibernating to the swapfile additionally requires a `resume=`/`resume_offset=` kernel parameter, which this patch does not configure.
 
 ### `disk_setup_for_btrfs_desktop_plain.sh` / `disk_setup_for_btrfs_desktop_subvolumes.sh`
 

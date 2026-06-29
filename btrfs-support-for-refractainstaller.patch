@@ -1,77 +1,79 @@
 From: Refracta user
-Date: 2026-06-28
-Subject: [PATCH v5] Learn btrfs subvolume layout from disk + NoCoW swapfile
+Date: 2026-06-29
+Subject: [PATCH v6] btrfs layout learning + NoCoW/RAM-sized swap + EFI /boot fix
 
 This patch adds btrfs filesystem support to both the GUI (yad) and CLI
-versions of refractainstaller, fixes EFI partition mounting, mirrors the
-installer log to the target disk, and — new in v5 — makes the installer
-LEARN the btrfs subvolume layout from the disk instead of hard-coding it.
+versions of refractainstaller, makes the installer LEARN the btrfs subvolume
+layout from the disk, fixes EFI partition mounting and grub installation,
+and mirrors the installer log to the target disk.
 
 Filesystem options added:
 
   1. "btrfs (single partition)" - formats the root partition as btrfs
-     without subvolumes. Single fstab entry, no subvol= option. The
-     top-level btrfs volume (subvolid=5) is mounted as /.
+     without subvolumes. The top-level volume (subvolid=5) is mounted as /.
 
   2. "btrfs (with subvolumes)" - formats as btrfs, creates a set of
      subvolumes, mounts each at its mountpoint before rsync, and writes
      multiple fstab entries (all sharing one UUID with subvol= options).
 
-Learning the layout from the disk (v5):
+Learning the layout from the disk:
 
-  The installer no longer hard-codes which subvolumes exist or where they
-  mount. The disk-setup script writes a small manifest at the btrfs top
-  level (subvolid=5), named ".refracta-btrfs-layout", with one TAB-separated
-  "<subvolume><TAB><mountpoint>" line per subvolume. The new
-  load_btrfs_layout() function:
+  The disk-setup script writes a manifest at the btrfs top level (subvolid=5),
+  ".refracta-btrfs-layout", with one TAB-separated "<subvolume><TAB><mountpoint>"
+  line per subvolume. load_btrfs_layout() reads it (authoritative), or else
+  discovers existing subvolumes via `btrfs subvolume list` and guesses
+  mountpoints by convention (btrfs_guess_mount). Entries are sorted by
+  mountpoint depth so parents mount before children, and the root subvolume
+  (whichever maps to "/") is derived rather than assumed to be "@rootfs". Any
+  subvolume scheme therefore works with no edits to the installer.
 
-    - mounts subvolid=5 and reads the manifest if present (authoritative),
-    - otherwise discovers the existing subvolumes with `btrfs subvolume list`
-      and guesses mountpoints by convention (btrfs_guess_mount),
-    - sorts entries by mountpoint depth so parents mount before children,
-    - derives the root subvolume (the one mapped to "/") rather than
-      assuming the name "@rootfs".
+Swapfile (RAM-sized everywhere, NoCoW on btrfs):
 
-  This means ANY subvolume scheme works with no edits to the installer.
-  The built-in arrays remain only as a fallback for the installer's own
-  "btrfs (with subvolumes)" format menu, which now also WRITES the manifest
-  into the freshly-created filesystem so it can be re-learned later.
+  The swapfile is sized to match the target's RAM (rounded up to a whole GiB),
+  auto-detected from /proc/meminfo at install time, for EVERY filesystem -
+  instead of the stock 256 MiB default (which rounds to 0 GiB in `free -g`
+  and is useless). It falls back to the configured size if RAM can't be read.
+  On btrfs the swapfile is additionally made NoCoW (chattr +C on an empty file
+  before writing) or swapon would fail ("swapfile has holes"); when the layout
+  has a dedicated @swap subvolume the swapfile is created inside it (e.g.
+  /swap/swapfile) and the fstab swap entry points at the real path. chmod
+  precedes mkswap to avoid the "insecure permissions" warning.
 
-btrfs swapfile fix (v5):
+EFI boot fixes:
 
-  A btrfs swapfile must be NoCoW or swapon fails ("swapfile has holes").
-  The swapfile is now created with chattr +C on an empty file before any
-  data is written, for both plain btrfs and subvolume layouts. When the
-  layout has a dedicated @swap subvolume, the swapfile is created inside it
-  (kept out of root snapshots) and the fstab swap entry points at the real
-  path (e.g. /swap/swapfile).
-
-EFI boot fixes (unchanged from v4):
-
-  - ESP mount at /target/boot/efi has error checking (check_exit).
-  - mkdir -p avoids silent failure when the directory already exists.
-  - The ESP is unmounted from any existing mount point before mounting.
+  - ESP mount at /target/boot/efi has error checking (check_exit), mkdir -p,
+    a pre-unmount of the ESP from any existing mountpoint, and findmnt-based
+    verification (df does not list nested mounts).
   - install_grub() verifies the ESP is mounted before grub-install.
-  - ESP mount verification uses findmnt (df does not list nested mounts).
+  - install_grub() no longer blindly re-mounts a separate /boot in the chroot.
+    With EFI + a separate /boot, the ESP-setup phase already mounts /boot (with
+    the ESP under it); the redundant chroot remount stacked a second /boot that
+    SHADOWED /boot/efi, making grub-install fail with "cannot find EFI
+    directory". A findmnt guard now skips the remount when /boot is already
+    mounted, while still mounting it for the BIOS / no-ESP path.
 
-Dual logging (unchanged from v4):
+Dual logging:
 
-  - A background tail -F mirrors the installer error log to the target disk
-    in real time; clean_log() sanitizes passwords in both copies; a final
+  - A background tail -F mirrors the installer error log to the target disk in
+    real time; clean_log() (GUI) sanitizes passwords in both copies; a final
     sync runs at the end of the install.
 
+Changes from v5:
+  - install_grub(): findmnt guard around the chroot /boot remount, fixing
+    grub-install "cannot find EFI directory" on EFI + separate /boot installs.
+  - Swapfile is sized to match RAM (rounded up to a whole GiB) on ALL
+    filesystems, not just btrfs; chmod precedes mkswap.
+
 Changes from v4:
-  - Added load_btrfs_layout() + btrfs_guess_mount(): the layout is learned
-    from an on-disk manifest (or discovered), not hard-coded.
-  - Root subvolume is derived from the layout instead of assuming @rootfs.
+  - load_btrfs_layout() + btrfs_guess_mount(): layout learned from an on-disk
+    manifest (or discovered), not hard-coded; root subvolume derived from it.
   - The format-menu path writes the manifest into the new filesystem.
-  - btrfs swapfile is created NoCoW and routed into @swap when present.
+  - btrfs swapfile created NoCoW and routed into @swap when present.
 
 Compatibility:
-  - ext2/ext3/ext4 paths are unchanged; the patch only adds new branches.
+  - ext2/ext3/ext4 paths gain RAM-sized swap; otherwise unchanged.
   - Encryption (LUKS) is not combined with btrfs in this patch.
-  - The btrfs-progs package is required. A check is performed at runtime
-    with a user-friendly error message if mkfs.btrfs is missing.
+  - btrfs-progs is required; checked at runtime with a friendly error.
 
 Files patched:
   usr/bin/refractainstaller-yad  (GUI version, 9.6.6)
@@ -288,7 +290,7 @@ Apply with:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +1493,46 @@
+@@ -1333,14 +1493,58 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -322,23 +324,35 @@ Apply with:
 +		done
 +	fi
 +	mkdir -p "$(dirname "$swapfile_target")"
++	# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
++	# chattr +C only takes effect on an empty file, so set it before writing.
++	# (Only btrfs needs this; other filesystems don't.)
 +	if [[ "$fs_type_os" == "btrfs" ]]; then
-+		# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
-+		# chattr +C only takes effect on an empty file, so set it before writing.
 +		rm -f "$swapfile_target"
 +		truncate -s 0 "$swapfile_target"
 +		chattr +C "$swapfile_target" 2>/dev/null
 +	fi
-+	dd if=/dev/zero of="$swapfile_target" bs="$swapfile_blocksize" count="$swapfile_count" | \
++	# Size the swapfile to match the target's RAM (rounded up to a whole GiB) so
++	# it is large enough for hibernation. Applies to EVERY filesystem; the stock
++	# 256 MiB default rounds to 0 GiB in `free -g` and is useless on a desktop.
++	# Falls back to the configured size if RAM can't be read.
++	swap_bs="$swapfile_blocksize"
++	swap_count="$swapfile_count"
++	_mem_mib=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
++	if [[ -n "$_mem_mib" && "$_mem_mib" -ge 1 ]]; then
++		swap_bs="1M"
++		swap_count=$(( ( (_mem_mib + 1023) / 1024 ) * 1024 ))
++	fi
++	dd if=/dev/zero of="$swapfile_target" bs="$swap_bs" count="$swap_count" | \
  	tee >(yad --progress --pulsate --width=350 --auto-close --center --title=$"Making a swap file...")
 -	mkswap /target/swapfile ; check_exit 
 -	chmod 600 /target/swapfile
-+	mkswap "$swapfile_target" ; check_exit
 +	chmod 600 "$swapfile_target"
++	mkswap "$swapfile_target" ; check_exit
  fi
  
  
-@@ -1531,9 +1723,23 @@
+@@ -1531,9 +1735,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -363,7 +377,7 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1597,7 +1803,7 @@
+@@ -1597,7 +1815,7 @@
      echo -e $"\n Adding swap entry to fstab...\n"
      echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
  else
@@ -372,7 +386,7 @@ Apply with:
  fi
  
  
-@@ -1674,13 +1880,28 @@
+@@ -1674,13 +1892,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -404,12 +418,23 @@ Apply with:
  fi
  
  
-@@ -1696,7 +1917,17 @@
+@@ -1694,9 +1927,27 @@
+ # Setup GRUB 
+ echo $"Setting up grub bootloader.. Please wait.."
  
- # If /boot is separate partition, need to mount it in chroot for grub
+-# If /boot is separate partition, need to mount it in chroot for grub
++# If /boot is separate partition, mount it in the chroot for grub — but only if
++# it isn't already mounted. With EFI + a separate /boot, the ESP-setup phase
++# already mounts $boot_dev at /target/boot (with the ESP under it at
++# /target/boot/efi). Re-mounting here stacks a second /boot that SHADOWS
++# /boot/efi inside the chroot, making grub-install fail with "cannot find EFI
++# directory". The findmnt guard skips the redundant remount in that case while
++# still mounting /boot for the BIOS / no-ESP path.
  if [[ -n $boot_dev ]] ; then
 -    chroot /target mount $boot_dev /boot
-+    chroot /target mount $boot_dev /boot 2>/dev/null || true
++    if ! findmnt /target/boot >/dev/null 2>&1 ; then
++        chroot /target mount $boot_dev /boot 2>/dev/null || true
++    fi
 +fi
 +
 +# Verify ESP is mounted for EFI install before running grub-install
@@ -423,7 +448,7 @@ Apply with:
  fi
  
  
-@@ -1836,7 +2067,8 @@
+@@ -1836,7 +2087,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -433,7 +458,7 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -2058,10 +2290,12 @@
+@@ -2058,10 +2310,12 @@
  	# clear the log of plain-text passwords
  	if [ -n "$newpass" ]; then
  		sed -i "s|$newpass|\*\*\*\*|"g $error_log
@@ -446,7 +471,7 @@ Apply with:
  	fi
  	newpass=""
  	confirm_newpass=""
-@@ -2166,6 +2400,14 @@
+@@ -2166,6 +2420,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
@@ -636,16 +661,16 @@ Apply with:
 +		} > "$_btrfs_top/$btrfs_layout_manifest"
 +		umount "$_btrfs_top"; rmdir "$_btrfs_top"
 +	fi
-+fi
-+
+ fi
+ 
+-mount "$install_part" /target ; check_exit 
 +# Mount root partition (or the subvolume mapped to "/")
 +if [[ "$btrfs_mode" == "subvol" ]]; then
 +	mount -o subvol="$btrfs_root_subvol" "$install_part" /target ; check_exit
 +else
 +	mount "$install_part" /target ; check_exit
- fi
- 
--mount "$install_part" /target ; check_exit 
++fi
++
 +# Mount btrfs subvolumes for /home, /var, /tmp, /.snapshots
 +if [[ "$btrfs_mode" == "subvol" ]]; then
 +	for _idx in "${!btrfs_subvols[@]}"; do
@@ -659,7 +684,7 @@ Apply with:
  
  # make mount point for separate home if needed
  # and add /home/* to the excludes list if it's not already there
-@@ -1222,14 +1369,46 @@
+@@ -1222,14 +1369,59 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -696,20 +721,33 @@ Apply with:
 +		done
 +	fi
 +	mkdir -p "$(dirname "$swapfile_target")"
++	# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
++	# chattr +C only takes effect on an empty file, so set it before writing.
++	# (Only btrfs needs this; other filesystems don't.)
 +	if [[ "$fs_type_os" == "btrfs" ]]; then
-+		# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
-+		# chattr +C only takes effect on an empty file, so set it before writing.
 +		rm -f "$swapfile_target"
 +		truncate -s 0 "$swapfile_target"
 +		chattr +C "$swapfile_target" 2>/dev/null
 +	fi
-+	dd if=/dev/zero of="$swapfile_target" bs="$swapfile_blocksize" count="$swapfile_count" ; check_exit
-+	mkswap "$swapfile_target" ; check_exit
++	# Size the swapfile to match the target's RAM (rounded up to a whole GiB) so
++	# it is large enough for hibernation. Applies to EVERY filesystem; the stock
++	# 256 MiB default rounds to 0 GiB in `free -g` and is useless on a desktop.
++	# Falls back to the configured size if RAM can't be read.
++	swap_bs="$swapfile_blocksize"
++	swap_count="$swapfile_count"
++	_mem_mib=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
++	if [[ -n "$_mem_mib" && "$_mem_mib" -ge 1 ]]; then
++		swap_bs="1M"
++		swap_count=$(( ( (_mem_mib + 1023) / 1024 ) * 1024 ))
++		echo -e $"\n Sizing swapfile to ${swap_count} MiB to match RAM (${_mem_mib} MiB)...\n"
++	fi
++	dd if=/dev/zero of="$swapfile_target" bs="$swap_bs" count="$swap_count" ; check_exit
 +	chmod 600 "$swapfile_target"
++	mkswap "$swapfile_target" ; check_exit
  fi
  
  # Disallow mounting of all fixed drives with pmount
-@@ -1427,9 +1606,23 @@
+@@ -1427,9 +1619,23 @@
  	fi
  fi
  echo -e $"\n Creating /etc/fstab...\n"
@@ -734,7 +772,7 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if [[ -n $home_part ]] ; then
-@@ -1466,7 +1659,7 @@
+@@ -1466,7 +1672,7 @@
  	echo -e $"\n Adding swap entry to fstab...\n"
  	echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
  else
@@ -743,16 +781,27 @@ Apply with:
  fi
  
  
-@@ -1526,7 +1719,7 @@
+@@ -1524,9 +1730,17 @@
+ mount --bind /proc/ /target/proc/ ; check_exit 
+ mount --bind /sys/ /target/sys/ ; check_exit 
  
- # If /boot is separate partition, need to mount it in chroot for grub and for efi
+-# If /boot is separate partition, need to mount it in chroot for grub and for efi
++# If /boot is separate partition, mount it in the chroot for grub — but only if
++# it isn't already mounted. With EFI + a separate /boot, the ESP-setup phase
++# already mounts $boot_dev at /target/boot (with the ESP under it at
++# /target/boot/efi). Re-mounting here stacks a second /boot that SHADOWS
++# /boot/efi inside the chroot, making grub-install fail with "cannot find EFI
++# directory". The findmnt guard skips the redundant remount in that case while
++# still mounting /boot for the BIOS / no-ESP path.
  if [[ -n $boot_dev ]] ; then
 -    chroot /target mount $boot_dev /boot
-+    chroot /target mount $boot_dev /boot 2>/dev/null || true
++    if ! findmnt /target/boot >/dev/null 2>&1 ; then
++        chroot /target mount $boot_dev /boot 2>/dev/null || true
++    fi
  fi
  
  # This test is not complete and should probably be done earlier. grub_dev="efi" above
-@@ -1543,8 +1736,24 @@
+@@ -1543,8 +1757,24 @@
  	fi
      echo -e $"\n Adding esp entry to fstab...\n"
      echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
@@ -779,7 +828,7 @@ Apply with:
  fi
  
  
-@@ -1552,6 +1761,16 @@
+@@ -1552,6 +1782,16 @@
  # Setup GRUB 
  echo -e $"\n Setting up grub bootloader.. Please wait..\n"
  
@@ -796,7 +845,7 @@ Apply with:
  
  
  #grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
-@@ -1659,7 +1878,8 @@
+@@ -1659,7 +1899,8 @@
  
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -806,7 +855,7 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1918,6 +2138,14 @@
+@@ -1918,6 +2159,14 @@
  fi
  
  
