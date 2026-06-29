@@ -10,9 +10,9 @@ Two problems had to be solved:
 
 1. **Refractainstaller only supports ext2/ext3/ext4.** There was no way to install onto btrfs, let alone btrfs with subvolumes — the installer would silently reformat a pre-created btrfs partition to ext4, destroying all subvolumes.
 
-2. **The installed system would not boot under VirtualBox EFI.** Refractainstaller's default config does not create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, relying entirely on an NVRAM boot entry. VirtualBox's EFI NVRAM support is unreliable, and NVRAM does not travel with the disk — so the installed system could not boot.
+2. **The installed system would not boot under VirtualBox EFI.** Refractainstaller's default config does not create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, relying entirely on an NVRAM boot entry. VirtualBox's EFI NVRAM support is unreliable, and NVRAM does not travel with the disk — so the installed system could not boot. Additionally, the installer's EFI partition mounting logic had no error checking — if the ESP mount failed silently, `grub-install` would run with no ESP available and fail, but the error was non-obvious and the installer would continue.
 
-These three files solve both problems and automate the setup.
+These files solve both problems and automate the setup.
 
 ## Files
 
@@ -30,14 +30,15 @@ What it does:
 
 1. **Downloads** the five Refracta `.deb` packages from SourceForge.
 2. **Installs** them via `apt-get install` (which resolves dependencies), plus `btrfs-progs` for btrfs support.
-3. **Sets `COMPRESS=gzip`** in `/etc/initramfs-tools/initramfs.conf` and rebuilds the initramfs for all kernels. (The default compression can cause boot issues with some live-boot configurations.)
-4. **Uncomments `media_opt="--force-extra-removable"`** in `/etc/refractainstaller.conf`. This makes `grub-install` create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, fixing the VirtualBox EFI boot failure.
+3. **Holds** `refractainstaller-base` and `refractainstaller-gui` (`apt-mark hold`). These packages carry the btrfs patch and are installed manually from SourceForge `.deb`s, so no apt repository provides them and a normal `apt upgrade` will never touch them. The hold is a safeguard against a future apt-driven reinstall/upgrade (e.g. if Refracta ever lands in Debian's repos) silently overwriting the patched `/usr/bin/refractainstaller{,-yad}` with a stock version.
+4. **Sets `COMPRESS=gzip`** in `/etc/initramfs-tools/initramfs.conf` and rebuilds the initramfs for all kernels. (The default compression can cause boot issues with some live-boot configurations.)
+5. **Uncomments `media_opt="--force-extra-removable"`** in `/etc/refractainstaller.conf`. This makes `grub-install` create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, fixing the VirtualBox EFI boot failure.
 
 After this script completes, apply the btrfs patch (below) if you want btrfs support, then run the seed script (below), then run `refractasnapshot` to create the ISO.
 
 ### `btrfs-support-for-refractainstaller.patch`
 
-**Patch for refractainstaller. Adds btrfs filesystem support (single partition + subvolumes).**
+**Patch for refractainstaller. Adds btrfs filesystem support, fixes EFI partition mounting, and adds dual logging.**
 
 A standard unified diff that patches both the GUI and CLI versions of refractainstaller (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`).
 
@@ -45,14 +46,18 @@ A standard unified diff that patches both the GUI and CLI versions of refractain
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 ```
 
+The patch has evolved through five versions:
+
+#### v1 — btrfs filesystem support
+
 Adds two new options to the filesystem selection menu:
 
 | Option | Behaviour |
 |---|---|
 | **btrfs (single partition)** | Formats the root partition as btrfs. Single fstab entry, no subvolumes. The top-level btrfs volume (subvolid=5) is mounted as `/`. |
-| **btrfs (with subvolumes)** | Formats as btrfs and creates five subvolumes, mounts each at its mount point before rsync, generates multi-entry fstab with `subvol=` options, and adds `rootflags=subvol=@rootfs` to the GRUB kernel command line. |
+| **btrfs (with subvolumes)** | Formats as btrfs and creates five subvolumes, mounts each at its mount point before rsync, generates multi-entry fstab with `subvol=` options. |
 
-Default subvolumes created by the "with subvolumes" option:
+Default subvolumes created by the "with subvolumes" option (this built-in set is the **fallback** only — as of v5 the real layout is learned from the disk; see below):
 
 | Subvolume | Mount point |
 |---|---|
@@ -70,27 +75,107 @@ Additional behaviour:
 - A runtime check for `btrfs-progs` (`mkfs.btrfs`) is performed with a user-friendly error message if missing.
 - ext2/ext3/ext4 paths are unchanged — the patch only adds new branches.
 
-### `disk_setup_for_btrfs_desktop.sh`
+#### v2 — btrfs bug fixes
 
-**Disk partitioning script. Run from the Refracta live ISO on the target machine before running refractainstaller.**
+Two bugs discovered during real installation testing:
 
-Wipes the target disk and creates a GPT partition table with btrfs subvolumes, ready for the "Do not format" installer path.
+- **Subvolume creation with `no_format=yes`**: v1 tried to create subvolumes even when "Do not format" was selected and the subvolumes already existed, causing a non-fatal "File exists" error. Fixed by moving subvolume creation inside the `no_format` check — subvolumes are now only created when actually formatting.
+- **Duplicated `rootflags` in kernel command line**: v1 used `sed` to add `rootflags=subvol=@rootfs` to `GRUB_CMDLINE_LINUX_DEFAULT`, but `update-grub` (grub-mkconfig) already auto-detects btrfs subvolume roots and adds this parameter automatically. The `sed` caused the parameter to appear twice in the kernel command line. Fixed by removing the redundant `sed` — `update-grub` handles it.
+
+#### v3 — EFI boot fixes + dual logging
+
+Three categories of fixes discovered when the installed system still wouldn't boot despite v2:
+
+**EFI partition mounting:**
+
+The original installer had no error checking on the ESP mount. The exact sequence that broke: when using a separate `/boot` partition, rsync copies the live system's `/boot/efi/` directory (with bootloader files) onto the `/boot` partition. Later, `mkdir /target/boot/efi` fails silently (directory already exists from rsync), and `mount "$esp_dev" /target/boot/efi/` has no error checking — if it fails, `grub-install` runs with no ESP available and fails, but the installer continues (the user clicks "Continue" on the error dialog).
+
+Fixes applied:
+
+- `mount $boot_dev /target/boot` now has `check_exit` — failure is caught, not silent.
+- `mkdir` changed to `mkdir -p` — no more silent failure when the `efi/` directory already exists from rsync.
+- The ESP is explicitly unmounted from any existing mount point (e.g. the live system's `/boot/efi`) before being mounted at `/target/boot/efi`, preventing "device already mounted" failures.
+- `mount "$esp_dev" /target/boot/efi/` now has `check_exit` — if it fails, the installer aborts with a clear error message instead of continuing to a broken `grub-install`.
+- `install_grub()` verifies the ESP is actually mounted before running `grub-install` in EFI mode — aborts with a clear error if not.
+- The `chroot /target mount $boot_dev /boot` in `install_grub()` is now non-fatal (`|| true`) since `/boot` may already be mounted from the fstab/ESP setup phase.
+
+**Dual logging:**
+
+The installer's error log (`/var/log/refractainstaller.log`) lives on the live system's filesystem. When `grub-install` fails, the error goes to the live system's log — but the only log that survives after reboot is the one rsync'd to the target disk, which is a snapshot from before `grub-install` ran. The actual error is lost.
+
+Fixes applied:
+
+- After rsync completes, a background `tail -n +1 -F` process mirrors the installer's error log to `/target/var/log/refractainstaller.log` in real-time. Both the live system and the target disk have byte-for-byte identical logs at every point during the install.
+- `clean_log()` (GUI only) now sanitizes plaintext passwords in both log copies.
+- At the end of the install, the tail process is stopped and a final `cp` sync is performed.
+- If the install crashes or the user examines either disk, both logs contain the same information.
+
+#### v4 — findmnt fix for nested mount verification
+
+Discovered during a real install test: the ESP mount verification added in v3 used `df | grep -q "/target/boot/efi"` to check if the ESP was mounted. However, `df` without arguments only shows top-level mount points — it does not list nested mounts. Since `/target/boot/efi` is mounted **under** `/target/boot` (which is under `/target`), `df` collapses it and the grep fails — even when the ESP is correctly mounted. This caused the installer to abort with "EFI partition is not mounted" despite the mount being perfectly fine.
+
+Fix applied:
+
+- Replaced all `df | grep` ESP verification checks with `findmnt`, which reliably detects nested mounts. This affects three checks per script: the ESP pre-unmount check, the post-mount verification, and the `install_grub()` pre-flight check.
+
+#### v5 — learn the subvolume layout from the disk + NoCoW swapfile
+
+Up to v4 the subvolume scheme was hard-coded in the installer (`@rootfs @home @var @tmp @snapshots`). That meant any disk created with a different layout (e.g. `disk_setup_for_btrfs_desktop_subvolumes.sh`, which uses `@var_log @var_cache @libvirt_images @swap …`) would have its extra subvolumes **silently ignored** — their contents would land inside `@rootfs` instead of on their own subvolume. v5 removes the hard-coding entirely.
+
+**The installer now learns the layout from the disk:**
+
+- The disk-setup script writes a manifest at the btrfs **top level (subvolid=5)** called `.refracta-btrfs-layout`, with one TAB-separated `<subvolume><TAB><mountpoint>` line per subvolume.
+- A new `load_btrfs_layout()` function mounts subvolid=5 and:
+  1. reads the manifest if present (**authoritative** — any layout, any subvolume names);
+  2. otherwise **discovers** the existing subvolumes via `btrfs subvolume list` and guesses mountpoints by convention (`btrfs_guess_mount`, e.g. `@var_log → /var/log`, `@libvirt_images → /var/lib/libvirt/images`);
+  3. sorts entries by mountpoint depth so **parents mount before children**;
+  4. derives the **root subvolume** (whichever maps to `/`) instead of assuming the name `@rootfs`.
+- The installer's own "btrfs (with subvolumes)" format menu still uses the built-in fallback arrays, but now also **writes the manifest** into the freshly-created filesystem so it can be re-learned on a later reinstall.
+
+Why a manifest rather than inferring from names? A btrfs subvolume stores no mountpoint metadata, and names alone are ambiguous — `@libvirt_images` cannot be mapped to `/var/lib/libvirt/images` by any naming rule, and `@snapshots → /.snapshots`, `@swap`, and `@rootfs → /` are all special cases. The manifest makes the disk-setup script the single source of truth and the installer fully layout-agnostic. (Name-convention discovery is kept only as a best-effort fallback for disks that have no manifest.)
+
+**btrfs swapfile fix:**
+
+A btrfs swapfile must be NoCoW or `swapon` fails with "swapfile has holes". The installer's original `dd`-based swapfile creation produced a CoW file on btrfs and would not activate. v5:
+
+- creates the swapfile with `chattr +C` on an empty file **before** writing any data, for both plain btrfs and subvolume layouts;
+- when the layout has a dedicated `@swap` subvolume, creates the swapfile **inside it** (e.g. `/swap/swapfile`), keeping it out of root snapshots, and points the fstab swap entry at the real path.
+
+### `disk_setup_for_btrfs_desktop_plain.sh` / `disk_setup_for_btrfs_desktop_subvolumes.sh`
+
+**Disk partitioning scripts. Run from the Refracta live ISO on the target machine before running refractainstaller.** Pick one:
+
+- `disk_setup_for_btrfs_desktop_plain.sh` — plain btrfs root, no subvolumes.
+- `disk_setup_for_btrfs_desktop_subvolumes.sh` — btrfs with subvolumes for effective snapshots, **and writes the layout manifest** the installer learns from.
+
+Both wipe the target disk and create a GPT partition table, ready for the "Do not format" installer path.
 
 ```bash
-sudo bash disk_setup_for_btrfs_desktop.sh
+sudo bash disk_setup_for_btrfs_desktop_subvolumes.sh   # or _plain.sh
 ```
 
-Creates a three-partition layout on `/dev/nvme0n1` (configurable at the top of the script):
+Both create the same three-partition layout on `/dev/nvme0n1` (configurable at the top of the script):
 
 | Partition | Size | Type | FS | Mount |
 |---|---|---|---|---|
 | p1 | 1024 MiB | EF00 (EFI System) | FAT32 | `/boot/efi` |
 | p2 | 1024 MiB | 8300 (Linux) | ext4 | `/boot` |
-| p3 | ~253 GiB | 8300 (Linux) | btrfs | `/` (subvolumes) |
+| p3 | ~253 GiB | 8300 (Linux) | btrfs | `/` (plain, or subvolumes) |
 
-Five btrfs subvolumes are created on p3: `@rootfs`, `@home`, `@var`, `@tmp`, `@snapshots`.
+The **subvolumes** script defines its layout once (a single `subvol:mountpoint` array) and creates these subvolumes on p3, then records them in the `.refracta-btrfs-layout` manifest at the btrfs top level:
 
-After this script runs, launch `refractainstaller-gui` and select **"Do not format"** — the installer (with the btrfs patch applied) will auto-detect the existing subvolumes and mount them correctly.
+| Subvolume | Mount point |
+|---|---|
+| `@rootfs` | `/` |
+| `@home` | `/home` |
+| `@var_log` | `/var/log` |
+| `@var_cache` | `/var/cache` |
+| `@libvirt_images` | `/var/lib/libvirt/images` |
+| `@swap` | `/swap` (NoCoW swapfile created here by the installer) |
+| `@tmp` | `/tmp` |
+| `@snapshots` | `/.snapshots` |
+
+To change the layout, just edit the `BTRFS_LAYOUT` array at the top of the subvolumes script — the installer learns whatever you put there, with no code changes. After the script runs, launch `refractainstaller-gui` and select **"Do not format"** — the installer reads the manifest and mounts every subvolume at its recorded mountpoint, writes the matching fstab, and puts the swapfile in `@swap`.
 
 ### `refracta_seed_home_environment_before_iso_creation.sh`
 
@@ -139,10 +224,11 @@ Ownership of `/etc/skel` is set to `root:root` after copying. The live system re
 │  TARGET MACHINE (VirtualBox or bare metal)              │
 │                                                         │
 │  1. Boot from the ISO                                   │
-│  2. sudo bash disk_setup_for_btrfs_desktop.sh           │
+│  2. sudo bash disk_setup_for_btrfs_desktop_subvolumes.sh│
+│       (or _plain.sh; writes the layout manifest)        │
 │  3. Run refractainstaller-gui                           │
-│     → select "btrfs (with subvolumes)"                  │
-│     → or use "Do not format" with pre-created layout    │
+│     → "Do not format": installer learns the layout      │
+│     → or select "btrfs (with subvolumes)" to format     │
 │  4. Reboot — system boots with EFI fallback bootloader  │
 └─────────────────────────────────────────────────────────┘
 ```

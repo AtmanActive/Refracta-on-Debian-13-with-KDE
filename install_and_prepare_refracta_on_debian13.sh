@@ -197,6 +197,20 @@ else
     ok "Packages installed successfully."
 fi
 
+# ── Pin the Refracta installer packages ─────────────────────────────────────────
+# refractainstaller-base/-gui carry our local btrfs patch (see the .patch file).
+# They are installed manually from SourceForge .debs, so no apt repository provides
+# them and a normal `apt upgrade` will never touch them. We still `apt-mark hold`
+# them as a safeguard: it stops any future apt-driven reinstall/upgrade (e.g. if
+# Refracta ever lands in Debian's repos) from silently overwriting the patched
+# /usr/bin/refractainstaller{,-yad} with a stock, unpatched version.
+log "Holding refractainstaller packages so the btrfs patch is never overwritten ..."
+if apt-mark hold refractainstaller-base refractainstaller-gui >/dev/null; then
+    ok "refractainstaller-base and refractainstaller-gui are on hold."
+else
+    warn "Could not place apt-mark hold on the refractainstaller packages."
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Configure initramfs Compression + Rebuild
 # ══════════════════════════════════════════════════════════════════════════════
@@ -326,6 +340,7 @@ echo ""
 echo -e "  ${CYAN}Create ISO:${RESET} Run refractasnapshot to create the custom ISO."
 echo ""
 echo -e "  ${CYAN}Disk setup + install:${RESET} On the target machine, run"
-echo -e "    disk_setup_for_btrfs_desktop.sh, then refractainstaller-gui."
+echo -e "    disk_setup_for_btrfs_desktop_subvolumes.sh (or _plain.sh),"
+echo -e "    then refractainstaller-gui (choose 'Do not format')."
 echo ""
 ok "Done."

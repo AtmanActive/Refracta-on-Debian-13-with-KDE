@@ -1,53 +1,77 @@
 From: Refracta user
-Date: 2026-06-26
-Subject: [PATCH] Add btrfs filesystem support (single + subvolumes) to refractainstaller
+Date: 2026-06-28
+Subject: [PATCH v5] Learn btrfs subvolume layout from disk + NoCoW swapfile
 
-This patch adds two new filesystem options to both the GUI (yad) and CLI
-versions of refractainstaller:
+This patch adds btrfs filesystem support to both the GUI (yad) and CLI
+versions of refractainstaller, fixes EFI partition mounting, mirrors the
+installer log to the target disk, and — new in v5 — makes the installer
+LEARN the btrfs subvolume layout from the disk instead of hard-coding it.
+
+Filesystem options added:
 
   1. "btrfs (single partition)" - formats the root partition as btrfs
-     without subvolumes. Produces a single fstab entry with no subvol=
-     option. The top-level btrfs volume (subvolid=5) is mounted as /.
+     without subvolumes. Single fstab entry, no subvol= option. The
+     top-level btrfs volume (subvolid=5) is mounted as /.
 
-  2. "btrfs (with subvolumes)" - formats the root partition as btrfs and
-     creates a standard set of subvolumes, then mounts @rootfs as / and
-     the remaining subvolumes at their respective mount points before
-     rsync. Produces multiple fstab entries (one per subvolume, all
-     sharing the same UUID with subvol= options). Also adds
-     rootflags=subvol=@rootfs to GRUB_CMDLINE_LINUX_DEFAULT so the
-     initramfs mounts the correct subvolume as root.
+  2. "btrfs (with subvolumes)" - formats as btrfs, creates a set of
+     subvolumes, mounts each at its mountpoint before rsync, and writes
+     multiple fstab entries (all sharing one UUID with subvol= options).
 
-Default subvolumes created:
-  @rootfs     -> /
-  @home       -> /home
-  @var        -> /var
-  @tmp        -> /tmp
-  @snapshots  -> /.snapshots
+Learning the layout from the disk (v5):
 
-When "btrfs (with subvolumes)" is selected, the separate /home partition
-option is automatically disabled (with a user notification) because /home
-becomes a subvolume on the same btrfs filesystem.
+  The installer no longer hard-codes which subvolumes exist or where they
+  mount. The disk-setup script writes a small manifest at the btrfs top
+  level (subvolid=5), named ".refracta-btrfs-layout", with one TAB-separated
+  "<subvolume><TAB><mountpoint>" line per subvolume. The new
+  load_btrfs_layout() function:
 
-When the "Do not format" option (no_format=yes) is used on a partition
-that is already btrfs, the patch auto-detects whether subvolumes exist
-(by checking for @rootfs) and sets the btrfs mode accordingly. This
-allows users to pre-format with btrfs and pre-create subvolumes using
-their own scripts, then run the installer with "Do not format" to use
-the existing layout.
+    - mounts subvolid=5 and reads the manifest if present (authoritative),
+    - otherwise discovers the existing subvolumes with `btrfs subvolume list`
+      and guesses mountpoints by convention (btrfs_guess_mount),
+    - sorts entries by mountpoint depth so parents mount before children,
+    - derives the root subvolume (the one mapped to "/") rather than
+      assuming the name "@rootfs".
 
-The patch also extends the update-initramfs condition to rebuild the
-initramfs when btrfs is selected, ensuring btrfs modules and tools are
-included.
+  This means ANY subvolume scheme works with no edits to the installer.
+  The built-in arrays remain only as a fallback for the installer's own
+  "btrfs (with subvolumes)" format menu, which now also WRITES the manifest
+  into the freshly-created filesystem so it can be re-learned later.
+
+btrfs swapfile fix (v5):
+
+  A btrfs swapfile must be NoCoW or swapon fails ("swapfile has holes").
+  The swapfile is now created with chattr +C on an empty file before any
+  data is written, for both plain btrfs and subvolume layouts. When the
+  layout has a dedicated @swap subvolume, the swapfile is created inside it
+  (kept out of root snapshots) and the fstab swap entry points at the real
+  path (e.g. /swap/swapfile).
+
+EFI boot fixes (unchanged from v4):
+
+  - ESP mount at /target/boot/efi has error checking (check_exit).
+  - mkdir -p avoids silent failure when the directory already exists.
+  - The ESP is unmounted from any existing mount point before mounting.
+  - install_grub() verifies the ESP is mounted before grub-install.
+  - ESP mount verification uses findmnt (df does not list nested mounts).
+
+Dual logging (unchanged from v4):
+
+  - A background tail -F mirrors the installer error log to the target disk
+    in real time; clean_log() sanitizes passwords in both copies; a final
+    sync runs at the end of the install.
+
+Changes from v4:
+  - Added load_btrfs_layout() + btrfs_guess_mount(): the layout is learned
+    from an on-disk manifest (or discovered), not hard-coded.
+  - Root subvolume is derived from the layout instead of assuming @rootfs.
+  - The format-menu path writes the manifest into the new filesystem.
+  - btrfs swapfile is created NoCoW and routed into @swap when present.
 
 Compatibility:
   - ext2/ext3/ext4 paths are unchanged; the patch only adds new branches.
-  - Encryption (LUKS) is not combined with btrfs in this patch. The
-    existing encryption logic uses mke2fs/cryptsetup and is left intact.
-    If a user selects both encryption and btrfs, the mke2fs path will
-    be used (btrfs is ignored). This matches current behaviour where
-    only ext-family filesystems are offered with encryption.
-  - The btrfs-progs package is required. A check is performed at
-    runtime with a user-friendly error message if mkfs.btrfs is missing.
+  - Encryption (LUKS) is not combined with btrfs in this patch.
+  - The btrfs-progs package is required. A check is performed at runtime
+    with a user-friendly error message if mkfs.btrfs is missing.
 
 Files patched:
   usr/bin/refractainstaller-yad  (GUI version, 9.6.6)
@@ -60,18 +84,94 @@ Apply with:
 
 --- a/usr/bin/refractainstaller-yad
 +++ b/usr/bin/refractainstaller-yad
-@@ -52,6 +52,10 @@
+@@ -52,6 +52,86 @@
  
  configfile="/etc/refractainstaller.conf"
  
-+# btrfs subvolume layout (used when "btrfs (with subvolumes)" is selected)
++# btrfs subvolume layout.
++#
++# The installer LEARNS the real layout from the disk instead of hard-coding it:
++# the disk-setup script writes a small manifest at the btrfs top level
++# (subvolid=5), named by $btrfs_layout_manifest, with one TAB-separated
++# "<subvolume><TAB><mountpoint>" line per subvolume. load_btrfs_layout() reads
++# it into the arrays below, so ANY subvolume scheme works with no edits here.
++#
++# The arrays below are only the FALLBACK used when no manifest is present (e.g.
++# when formatting via the installer's own "btrfs (with subvolumes)" menu).
++btrfs_layout_manifest=".refracta-btrfs-layout"
 +btrfs_subvols=( @rootfs @home @var @tmp @snapshots )
 +btrfs_subvol_mounts=( "/" "/home" "/var" "/tmp" "/.snapshots" )
++btrfs_root_subvol="@rootfs"   # the subvolume mounted at "/" (overridden by manifest)
++btrfs_layout_source="default" # "manifest", "guessed", or "default" (for messages)
++
++# btrfs_guess_mount SUBVOL
++#   Best-effort mountpoint for a subvolume name when no manifest exists.
++#   Known names are mapped explicitly; unknown "@a_b_c" become "/a/b/c".
++btrfs_guess_mount () {
++	case "$1" in
++		@rootfs|@root|@)  echo "/" ;;
++		@home)            echo "/home" ;;
++		@snapshots)       echo "/.snapshots" ;;
++		@swap)            echo "/swap" ;;
++		@var)             echo "/var" ;;
++		@var_log)         echo "/var/log" ;;
++		@var_cache)       echo "/var/cache" ;;
++		@libvirt_images)  echo "/var/lib/libvirt/images" ;;
++		@tmp)             echo "/tmp" ;;
++		@opt)             echo "/opt" ;;
++		@srv)             echo "/srv" ;;
++		@*)               local _n="${1#@}" ; echo "/${_n//_//}" ;;
++		*)                echo "" ;;
++	esac
++}
++
++# load_btrfs_layout DEVICE
++#   Learn the btrfs subvolume layout of DEVICE by mounting its top level
++#   (subvolid=5) and either (1) reading the layout manifest if present
++#   (authoritative), or (2) discovering the existing subvolumes with
++#   `btrfs subvolume list` and guessing their mountpoints by convention.
++#   Populates btrfs_subvols / btrfs_subvol_mounts (sorted shallow-first so
++#   parent mounts precede children) and btrfs_root_subvol / btrfs_layout_source.
++#   Returns 0 if any subvolumes were found (=> subvol mode), 1 otherwise.
++load_btrfs_layout () {
++	local _dev="$1" _tmp _raw="" _src="default" _rc=1 _sv _mp _i
++	_tmp=$(mktemp -d)
++	mount -o subvolid=5 "$_dev" "$_tmp" 2>/dev/null || { rmdir "$_tmp"; return 1; }
++	if [[ -f "$_tmp/$btrfs_layout_manifest" ]]; then
++		_raw=$(awk -F'\t' '/^[[:space:]]*#/{next} NF<2{next} {print $1"\t"$2}' "$_tmp/$btrfs_layout_manifest")
++		_src="manifest"
++	else
++		_raw=$(btrfs subvolume list "$_tmp" 2>/dev/null | awk '{print $NF}' \
++			| while read -r _s; do
++				[[ "$_s" == */* ]] && continue   # skip nested subvolumes
++				printf '%s\t%s\n' "$_s" "$(btrfs_guess_mount "$_s")"
++			done)
++		_src="guessed"
++	fi
++	umount "$_tmp" 2>/dev/null; rmdir "$_tmp"
++
++	if [[ -n "$_raw" ]]; then
++		btrfs_subvols=(); btrfs_subvol_mounts=()
++		while IFS=$'\t' read -r _ _sv _mp; do
++			[[ -z "$_sv" || -z "$_mp" ]] && continue
++			btrfs_subvols+=("$_sv"); btrfs_subvol_mounts+=("$_mp")
++		done < <(printf '%s\n' "$_raw" | awk -F'\t' 'NF>=2 && $2!="" {d=gsub(/\//,"/",$2); print d"\t"$1"\t"$2}' | sort -n -k1,1)
++		if [[ ${#btrfs_subvols[@]} -gt 0 ]]; then
++			btrfs_root_subvol="@rootfs"
++			for _i in "${!btrfs_subvols[@]}"; do
++				[[ "${btrfs_subvol_mounts[$_i]}" == "/" ]] && btrfs_root_subvol="${btrfs_subvols[$_i]}"
++			done
++			btrfs_layout_source="$_src"
++			_rc=0
++		fi
++	fi
++	return $_rc
++}
 +
  if [[ -f $configfile ]]; then
      source $configfile
  else
-@@ -851,10 +855,12 @@
+@@ -851,10 +931,12 @@
  # Choose filesystem type for OS.
  choose_fs_os () {
  fs_type_os=$(yad --list --title=$"Root Filesystem" --center --borders=10 --text=$"What type of filesystem would you like on $install_dev?" \
@@ -86,22 +186,27 @@ Apply with:
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +873,44 @@
+@@ -867,10 +949,48 @@
  fi  
  }
  
+-if [[ $no_format = "yes" ]]; then 
 +btrfs_mode=""
- if [[ $no_format = "yes" ]]; then 
++if [[ $no_format = "yes" ]]; then
  	fs_type_os=$(blkid -s TYPE "$install_dev" | awk -F"\"" '{ print $2 }')
 +	if [[ "$fs_type_os" == "btrfs" ]]; then
-+		_btrfs_tmp=$(mktemp -d)
-+		mount -o subvolid=5 "$install_dev" "$_btrfs_tmp" 2>/dev/null
-+		if btrfs subvolume list "$_btrfs_tmp" 2>/dev/null | grep -q @rootfs; then
++		# Learn the layout from the disk (manifest if present, else discover).
++		if load_btrfs_layout "$install_dev"; then
 +			btrfs_mode="subvol"
++			_layout_text=""
++			for _i in "${!btrfs_subvols[@]}"; do
++				_layout_text+="${btrfs_subvols[$_i]} -> ${btrfs_subvol_mounts[$_i]}"$'\n'
++			done
++			yad --info --title=$"btrfs subvolumes detected" --center --borders=10 --button=$"OK":0 \
++			  --text=$"Detected btrfs subvolume layout (source: $btrfs_layout_source):\n\n$_layout_text"
 +		else
 +			btrfs_mode="single"
 +		fi
-+		umount "$_btrfs_tmp" 2>/dev/null; rmdir "$_btrfs_tmp"
 +	fi
  else
  	choose_fs_os
@@ -131,7 +236,7 @@ Apply with:
  fi
  
  
-@@ -1251,9 +1291,37 @@
+@@ -1251,9 +1371,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -141,19 +246,31 @@ Apply with:
 +	else
 +		mke2fs -t $fs_type_os "$install_part"  # ; check_exit 
 +	fi
++
++# For btrfs with subvolumes, create subvolumes (only when formatting) and
++# record the layout in a manifest so the installer can re-learn it later.
++	if [[ "$btrfs_mode" == "subvol" ]]; then
++		_btrfs_top=$(mktemp -d)
++		mount -o subvolid=5 "$install_part" "$_btrfs_top"
++		for _sv in "${btrfs_subvols[@]}"; do
++			btrfs subvolume create "$_btrfs_top/$_sv"
++		done
++		{
++			echo "# Refracta btrfs subvolume layout"
++			echo "# <subvolume><TAB><mountpoint> — created by refractainstaller"
++			for _idx in "${!btrfs_subvols[@]}"; do
++				printf '%s\t%s\n' "${btrfs_subvols[$_idx]}" "${btrfs_subvol_mounts[$_idx]}"
++			done
++		} > "$_btrfs_top/$btrfs_layout_manifest"
++		umount "$_btrfs_top"; rmdir "$_btrfs_top"
++	fi
 +fi
 +
-+# For btrfs with subvolumes, create subvolumes and mount @rootfs
++# Mount root partition (or the subvolume mapped to "/")
 +if [[ "$btrfs_mode" == "subvol" ]]; then
-+	_btrfs_top=$(mktemp -d)
-+	mount -o subvolid=5 "$install_part" "$_btrfs_top"
-+	for _sv in "${btrfs_subvols[@]}"; do
-+		btrfs subvolume create "$_btrfs_top/$_sv"
-+	done
-+	umount "$_btrfs_top"; rmdir "$_btrfs_top"
-+	mount -o subvol=@rootfs "$install_part" /target ; check_exit 
++	mount -o subvol="$btrfs_root_subvol" "$install_part" /target ; check_exit
 +else
-+	mount "$install_part" /target ; check_exit 
++	mount "$install_part" /target ; check_exit
 +fi
 +
 +
@@ -171,13 +288,63 @@ Apply with:
  
  
  # make mount point for separate home if needed
-@@ -1531,9 +1599,23 @@
+@@ -1333,14 +1493,46 @@
+ ln -sv /run/shm /target/dev/shm
+ mkdir -v /target/dev/pts
+ 
++
++# Set up dual logging — real-time mirror of error log to the target disk
++# so that both the live system and the installed system have identical logs
++_target_error_log="/target/var/log/refractainstaller.log"
++if [[ -d /target/var/log ]]; then
++	tail -n +1 -F "$error_log" > "$_target_error_log" 2>/dev/null &
++	_log_tail_pid=$!
++fi
++
++
+ #*************************************************************
+ 
+ # create swapfile
+ if ! [[ $use_existing_swap = "yes" ]] ; then
+-	dd if=/dev/zero of=/target/swapfile bs="$swapfile_blocksize" count="$swapfile_count" | \
++	# Default swapfile location (non-btrfs and plain btrfs).
++	swapfile_fstab="/swapfile"
++	swapfile_target="/target/swapfile"
++	# On btrfs, if the layout has a dedicated @swap subvolume, put the swapfile
++	# there (kept out of root snapshots).
++	if [[ "$fs_type_os" == "btrfs" && "$btrfs_mode" == "subvol" ]]; then
++		for _idx in "${!btrfs_subvols[@]}"; do
++			if [[ "${btrfs_subvols[$_idx]}" == "@swap" ]]; then
++				swapfile_fstab="${btrfs_subvol_mounts[$_idx]}/swapfile"
++				swapfile_target="/target${btrfs_subvol_mounts[$_idx]}/swapfile"
++				break
++			fi
++		done
++	fi
++	mkdir -p "$(dirname "$swapfile_target")"
++	if [[ "$fs_type_os" == "btrfs" ]]; then
++		# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
++		# chattr +C only takes effect on an empty file, so set it before writing.
++		rm -f "$swapfile_target"
++		truncate -s 0 "$swapfile_target"
++		chattr +C "$swapfile_target" 2>/dev/null
++	fi
++	dd if=/dev/zero of="$swapfile_target" bs="$swapfile_blocksize" count="$swapfile_count" | \
+ 	tee >(yad --progress --pulsate --width=350 --auto-close --center --title=$"Making a swap file...")
+-	mkswap /target/swapfile ; check_exit 
+-	chmod 600 /target/swapfile
++	mkswap "$swapfile_target" ; check_exit
++	chmod 600 "$swapfile_target"
+ fi
+ 
+ 
+@@ -1531,9 +1723,23 @@
  		install_part="$install_dev"
  	fi
  fi
 -echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" > /target/etc/fstab
 +if [[ "$btrfs_mode" == "subvol" ]]; then
-+	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=@rootfs\t0\t1" > /target/etc/fstab
++	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=$btrfs_root_subvol\t0\t1" > /target/etc/fstab
 +else
 +	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" > /target/etc/fstab
 +fi
@@ -196,22 +363,67 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1601,6 +1683,14 @@
+@@ -1597,7 +1803,7 @@
+     echo -e $"\n Adding swap entry to fstab...\n"
+     echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
+ else
+-	echo -e "/swapfile\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
++	echo -e "${swapfile_fstab:-/swapfile}\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
  fi
  
  
-+# Add rootflags for btrfs subvolume boot
-+if [[ "$btrfs_mode" == "subvol" ]]; then
-+	if [ -f /target/etc/default/grub ]; then
-+		sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 rootflags=subvol=@rootfs"/' /target/etc/default/grub
+@@ -1674,13 +1880,28 @@
+ 	fi
+ 	
+ 	if [[ -n $boot_dev ]] ; then
+-		mount $boot_dev /target/boot
++		mount $boot_dev /target/boot ; check_exit
+ 	fi
+ 	
+     echo -e $"\n Adding esp entry to fstab...\n"
+     echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
+-	mkdir /target/boot/efi
+-	mount "$esp_dev" /target/boot/efi/
++	mkdir -p /target/boot/efi
++
++	# Unmount ESP from any existing mount point (e.g. live system's /boot/efi)
++	# so it's free to mount at /target/boot/efi
++	if findmnt "$esp_dev" >/dev/null 2>&1 ; then
++		umount "$esp_dev"
 +	fi
++
++	mount "$esp_dev" /target/boot/efi/ ; check_exit
++
++	# Verify the ESP is actually mounted at /target/boot/efi
++	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
++		yad --image="gtk-dialog-error" --title=$"Error" --center --borders=10 \
++		  --button=$"Exit":0 \
++		  --text=$"Failed to mount EFI partition $esp_dev at /target/boot/efi\n\nCannot install GRUB bootloader. Aborting."
++		exit 1
++	fi
+ fi
+ 
+ 
+@@ -1696,7 +1917,17 @@
+ 
+ # If /boot is separate partition, need to mount it in chroot for grub
+ if [[ -n $boot_dev ]] ; then
+-    chroot /target mount $boot_dev /boot
++    chroot /target mount $boot_dev /boot 2>/dev/null || true
 +fi
 +
-+
- # Add entry for root filesystem to crypttab if needed
- if [[ $encrypt_os = yes ]] ; then
- 	if [[ $use_uuid = yes ]]; then
-@@ -1836,7 +1926,8 @@
++# Verify ESP is mounted for EFI install before running grub-install
++if [[ $grub_dev = "efi" ]] ; then
++	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
++		yad --image="gtk-dialog-error" --title=$"Error" --center --borders=10 \
++		  --button=$"Exit":0 \
++		  --text=$"EFI partition is not mounted at /target/boot/efi\n\nCannot install GRUB bootloader. Aborting."
++		exit 1
++	fi
+ fi
+ 
+ 
+@@ -1836,7 +2067,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -221,20 +433,124 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
+@@ -2058,10 +2290,12 @@
+ 	# clear the log of plain-text passwords
+ 	if [ -n "$newpass" ]; then
+ 		sed -i "s|$newpass|\*\*\*\*|"g $error_log
++		[[ -n "$_target_error_log" && -f "$_target_error_log" ]] && sed -i "s|$newpass|\*\*\*\*|"g "$_target_error_log"
+ 	fi
+ 	
+ 	if [ -n "$confirm_newpass" ]; then
+ 		sed -i "s|$confirm_newpass|\*\*\*\*|"g $error_log
++		[[ -n "$_target_error_log" && -f "$_target_error_log" ]] && sed -i "s|$confirm_newpass|\*\*\*\*|"g "$_target_error_log"
+ 	fi
+ 	newpass=""
+ 	confirm_newpass=""
+@@ -2166,6 +2400,14 @@
+ 
+ yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
+ 
++# Stop dual logging and do final sync
++if [[ -n "$_log_tail_pid" ]]; then
++	kill "$_log_tail_pid" 2>/dev/null
++	wait "$_log_tail_pid" 2>/dev/null
++fi
++# Final sync of error log to target
++[[ -n "$_target_error_log" ]] && cp "$error_log" "$_target_error_log" 2>/dev/null
++
+ # copy error log to installation now before calling cleanup function
+ cp "$error_log" /target/home/"$newusername"/
+ chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
 --- a/usr/bin/refractainstaller
 +++ b/usr/bin/refractainstaller
-@@ -28,6 +28,10 @@
+@@ -28,6 +28,86 @@
  # variable. Normally, users should not edit anything in this script.
  configfile="/etc/refractainstaller.conf"
  
-+# btrfs subvolume layout (used when "btrfs (with subvolumes)" is selected)
++# btrfs subvolume layout.
++#
++# The installer LEARNS the real layout from the disk instead of hard-coding it:
++# the disk-setup script writes a small manifest at the btrfs top level
++# (subvolid=5), named by $btrfs_layout_manifest, with one TAB-separated
++# "<subvolume><TAB><mountpoint>" line per subvolume. load_btrfs_layout() reads
++# it into the arrays below, so ANY subvolume scheme works with no edits here.
++#
++# The arrays below are only the FALLBACK used when no manifest is present (e.g.
++# when formatting via the installer's own "btrfs (with subvolumes)" menu).
++btrfs_layout_manifest=".refracta-btrfs-layout"
 +btrfs_subvols=( @rootfs @home @var @tmp @snapshots )
 +btrfs_subvol_mounts=( "/" "/home" "/var" "/tmp" "/.snapshots" )
++btrfs_root_subvol="@rootfs"   # the subvolume mounted at "/" (overridden by manifest)
++btrfs_layout_source="default" # "manifest", "guessed", or "default" (for messages)
++
++# btrfs_guess_mount SUBVOL
++#   Best-effort mountpoint for a subvolume name when no manifest exists.
++#   Known names are mapped explicitly; unknown "@a_b_c" become "/a/b/c".
++btrfs_guess_mount () {
++	case "$1" in
++		@rootfs|@root|@)  echo "/" ;;
++		@home)            echo "/home" ;;
++		@snapshots)       echo "/.snapshots" ;;
++		@swap)            echo "/swap" ;;
++		@var)             echo "/var" ;;
++		@var_log)         echo "/var/log" ;;
++		@var_cache)       echo "/var/cache" ;;
++		@libvirt_images)  echo "/var/lib/libvirt/images" ;;
++		@tmp)             echo "/tmp" ;;
++		@opt)             echo "/opt" ;;
++		@srv)             echo "/srv" ;;
++		@*)               local _n="${1#@}" ; echo "/${_n//_//}" ;;
++		*)                echo "" ;;
++	esac
++}
++
++# load_btrfs_layout DEVICE
++#   Learn the btrfs subvolume layout of DEVICE by mounting its top level
++#   (subvolid=5) and either (1) reading the layout manifest if present
++#   (authoritative), or (2) discovering the existing subvolumes with
++#   `btrfs subvolume list` and guessing their mountpoints by convention.
++#   Populates btrfs_subvols / btrfs_subvol_mounts (sorted shallow-first so
++#   parent mounts precede children) and btrfs_root_subvol / btrfs_layout_source.
++#   Returns 0 if any subvolumes were found (=> subvol mode), 1 otherwise.
++load_btrfs_layout () {
++	local _dev="$1" _tmp _raw="" _src="default" _rc=1 _sv _mp _i
++	_tmp=$(mktemp -d)
++	mount -o subvolid=5 "$_dev" "$_tmp" 2>/dev/null || { rmdir "$_tmp"; return 1; }
++	if [[ -f "$_tmp/$btrfs_layout_manifest" ]]; then
++		_raw=$(awk -F'\t' '/^[[:space:]]*#/{next} NF<2{next} {print $1"\t"$2}' "$_tmp/$btrfs_layout_manifest")
++		_src="manifest"
++	else
++		_raw=$(btrfs subvolume list "$_tmp" 2>/dev/null | awk '{print $NF}' \
++			| while read -r _s; do
++				[[ "$_s" == */* ]] && continue   # skip nested subvolumes
++				printf '%s\t%s\n' "$_s" "$(btrfs_guess_mount "$_s")"
++			done)
++		_src="guessed"
++	fi
++	umount "$_tmp" 2>/dev/null; rmdir "$_tmp"
++
++	if [[ -n "$_raw" ]]; then
++		btrfs_subvols=(); btrfs_subvol_mounts=()
++		while IFS=$'\t' read -r _ _sv _mp; do
++			[[ -z "$_sv" || -z "$_mp" ]] && continue
++			btrfs_subvols+=("$_sv"); btrfs_subvol_mounts+=("$_mp")
++		done < <(printf '%s\n' "$_raw" | awk -F'\t' 'NF>=2 && $2!="" {d=gsub(/\//,"/",$2); print d"\t"$1"\t"$2}' | sort -n -k1,1)
++		if [[ ${#btrfs_subvols[@]} -gt 0 ]]; then
++			btrfs_root_subvol="@rootfs"
++			for _i in "${!btrfs_subvols[@]}"; do
++				[[ "${btrfs_subvol_mounts[$_i]}" == "/" ]] && btrfs_root_subvol="${btrfs_subvols[$_i]}"
++			done
++			btrfs_layout_source="$_src"
++			_rc=0
++		fi
++	fi
++	return $_rc
++}
 +
  
  show_help () {
  	programname="$0"
-@@ -685,12 +689,16 @@
+@@ -685,12 +765,16 @@
  	2) ext2
  	3) ext3
  	4) ext4
@@ -251,22 +567,26 @@ Apply with:
  	    esac
  	done
  	
-@@ -755,12 +763,35 @@
+@@ -755,12 +839,38 @@
  }
  
  
+-if [[ $no_format = "yes" ]]; then 
 +btrfs_mode=""
- if [[ $no_format = "yes" ]]; then 
++if [[ $no_format = "yes" ]]; then
  	fs_type_os=$(blkid -s TYPE "$install_dev" | awk -F"\"" '{ print $2 }')
 +	if [[ "$fs_type_os" == "btrfs" ]]; then
-+		_btrfs_tmp=$(mktemp -d)
-+		mount -o subvolid=5 "$install_dev" "$_btrfs_tmp" 2>/dev/null
-+		if btrfs subvolume list "$_btrfs_tmp" 2>/dev/null | grep -q @rootfs; then
++		# Learn the layout from the disk (manifest if present, else discover).
++		if load_btrfs_layout "$install_dev"; then
 +			btrfs_mode="subvol"
++			echo -e $"\n Detected btrfs subvolume layout (source: $btrfs_layout_source):"
++			for _i in "${!btrfs_subvols[@]}"; do
++				printf '   %-18s -> %s\n' "${btrfs_subvols[$_i]}" "${btrfs_subvol_mounts[$_i]}"
++			done
++			echo ""
 +		else
 +			btrfs_mode="single"
 +		fi
-+		umount "$_btrfs_tmp" 2>/dev/null; rmdir "$_btrfs_tmp"
 +	fi
  else
  	choose_fs_os
@@ -287,7 +607,7 @@ Apply with:
  
  # Enter device for /home partition or skip. If one is entered, test it.
  echo $"
-@@ -1138,11 +1169,36 @@
+@@ -1138,11 +1248,48 @@
  fi
  
  if [[ $no_format != "yes" ]]; then
@@ -298,22 +618,34 @@ Apply with:
 +	else
 +		mke2fs -t $fs_type_os "$install_part" # ; check_exit 
 +	fi
++
++# For btrfs with subvolumes, create subvolumes (only when formatting) and
++# record the layout in a manifest so the installer can re-learn it later.
++	if [[ "$btrfs_mode" == "subvol" ]]; then
++		_btrfs_top=$(mktemp -d)
++		mount -o subvolid=5 "$install_part" "$_btrfs_top"
++		for _sv in "${btrfs_subvols[@]}"; do
++			btrfs subvolume create "$_btrfs_top/$_sv"
++		done
++		{
++			echo "# Refracta btrfs subvolume layout"
++			echo "# <subvolume><TAB><mountpoint> — created by refractainstaller"
++			for _idx in "${!btrfs_subvols[@]}"; do
++				printf '%s\t%s\n' "${btrfs_subvols[$_idx]}" "${btrfs_subvol_mounts[$_idx]}"
++			done
++		} > "$_btrfs_top/$btrfs_layout_manifest"
++		umount "$_btrfs_top"; rmdir "$_btrfs_top"
++	fi
++fi
++
++# Mount root partition (or the subvolume mapped to "/")
++if [[ "$btrfs_mode" == "subvol" ]]; then
++	mount -o subvol="$btrfs_root_subvol" "$install_part" /target ; check_exit
++else
++	mount "$install_part" /target ; check_exit
  fi
  
 -mount "$install_part" /target ; check_exit 
-+# For btrfs with subvolumes, create subvolumes and mount @rootfs
-+if [[ "$btrfs_mode" == "subvol" ]]; then
-+	_btrfs_top=$(mktemp -d)
-+	mount -o subvolid=5 "$install_part" "$_btrfs_top"
-+	for _sv in "${btrfs_subvols[@]}"; do
-+		btrfs subvolume create "$_btrfs_top/$_sv"
-+	done
-+	umount "$_btrfs_top"; rmdir "$_btrfs_top"
-+	mount -o subvol=@rootfs "$install_part" /target ; check_exit 
-+else
-+	mount "$install_part" /target ; check_exit 
-+fi
-+
 +# Mount btrfs subvolumes for /home, /var, /tmp, /.snapshots
 +if [[ "$btrfs_mode" == "subvol" ]]; then
 +	for _idx in "${!btrfs_subvols[@]}"; do
@@ -327,13 +659,63 @@ Apply with:
  
  # make mount point for separate home if needed
  # and add /home/* to the excludes list if it's not already there
-@@ -1427,9 +1483,23 @@
+@@ -1222,14 +1369,46 @@
+ ln -sv /run/shm /target/dev/shm
+ mkdir -v /target/dev/pts
+ 
++
++# Set up dual logging — real-time mirror of error log to the target disk
++# so that both the live system and the installed system have identical logs
++_target_error_log="/target/var/log/refractainstaller.log"
++if [[ -d /target/var/log ]]; then
++	tail -n +1 -F "$error_log" > "$_target_error_log" 2>/dev/null &
++	_log_tail_pid=$!
++fi
++
++
+ #*************************************************************
+ 
+ # create swap
+ if ! [[ $use_existing_swap = "yes" ]] ; then
+ 	echo -e $"\n Making a swap file...\n"
+-	dd if=/dev/zero of=/target/swapfile bs="$swapfile_blocksize" count="$swapfile_count" ; check_exit 
+-	mkswap /target/swapfile ; check_exit 
+-	chmod 600 /target/swapfile
++	# Default swapfile location (non-btrfs and plain btrfs).
++	swapfile_fstab="/swapfile"
++	swapfile_target="/target/swapfile"
++	# On btrfs, if the layout has a dedicated @swap subvolume, put the swapfile
++	# there (kept out of root snapshots).
++	if [[ "$fs_type_os" == "btrfs" && "$btrfs_mode" == "subvol" ]]; then
++		for _idx in "${!btrfs_subvols[@]}"; do
++			if [[ "${btrfs_subvols[$_idx]}" == "@swap" ]]; then
++				swapfile_fstab="${btrfs_subvol_mounts[$_idx]}/swapfile"
++				swapfile_target="/target${btrfs_subvol_mounts[$_idx]}/swapfile"
++				break
++			fi
++		done
++	fi
++	mkdir -p "$(dirname "$swapfile_target")"
++	if [[ "$fs_type_os" == "btrfs" ]]; then
++		# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
++		# chattr +C only takes effect on an empty file, so set it before writing.
++		rm -f "$swapfile_target"
++		truncate -s 0 "$swapfile_target"
++		chattr +C "$swapfile_target" 2>/dev/null
++	fi
++	dd if=/dev/zero of="$swapfile_target" bs="$swapfile_blocksize" count="$swapfile_count" ; check_exit
++	mkswap "$swapfile_target" ; check_exit
++	chmod 600 "$swapfile_target"
+ fi
+ 
+ # Disallow mounting of all fixed drives with pmount
+@@ -1427,9 +1606,23 @@
  	fi
  fi
  echo -e $"\n Creating /etc/fstab...\n"
 -echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" >> /target/etc/fstab
 +if [[ "$btrfs_mode" == "subvol" ]]; then
-+	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=@rootfs\t0\t1" >> /target/etc/fstab
++	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=$btrfs_root_subvol\t0\t1" >> /target/etc/fstab
 +else
 +	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" >> /target/etc/fstab
 +fi
@@ -352,22 +734,69 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if [[ -n $home_part ]] ; then
-@@ -1470,6 +1540,14 @@
+@@ -1466,7 +1659,7 @@
+ 	echo -e $"\n Adding swap entry to fstab...\n"
+ 	echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
+ else
+-	echo -e "/swapfile\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
++	echo -e "${swapfile_fstab:-/swapfile}\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
  fi
  
  
-+# Add rootflags for btrfs subvolume boot
-+if [[ "$btrfs_mode" == "subvol" ]]; then
-+	if [ -f /target/etc/default/grub ]; then
-+		sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 rootflags=subvol=@rootfs"/' /target/etc/default/grub
+@@ -1526,7 +1719,7 @@
+ 
+ # If /boot is separate partition, need to mount it in chroot for grub and for efi
+ if [[ -n $boot_dev ]] ; then
+-    chroot /target mount $boot_dev /boot
++    chroot /target mount $boot_dev /boot 2>/dev/null || true
+ fi
+ 
+ # This test is not complete and should probably be done earlier. grub_dev="efi" above
+@@ -1543,8 +1736,24 @@
+ 	fi
+     echo -e $"\n Adding esp entry to fstab...\n"
+     echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
+-	mkdir /target/boot/efi
+-	mount "$esp_dev" /target/boot/efi/
++	mkdir -p /target/boot/efi
++
++	# Unmount ESP from any existing mount point (e.g. live system's /boot/efi)
++	# so it's free to mount at /target/boot/efi
++	if findmnt "$esp_dev" >/dev/null 2>&1 ; then
++		umount "$esp_dev"
++	fi
++
++	mount "$esp_dev" /target/boot/efi/ ; check_exit
++
++	# Verify the ESP is actually mounted at /target/boot/efi
++	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
++		echo $"
++ ERROR: Failed to mount EFI partition $esp_dev at /target/boot/efi
++ Cannot install GRUB bootloader. Aborting.
++"
++		exit 1
++	fi
+ fi
+ 
+ 
+@@ -1552,6 +1761,16 @@
+ # Setup GRUB 
+ echo -e $"\n Setting up grub bootloader.. Please wait..\n"
+ 
++# Verify ESP is mounted for EFI install before running grub-install
++if [[ $grub_dev = "efi" ]] ; then
++	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
++		echo $"
++ ERROR: EFI partition is not mounted at /target/boot/efi
++ Cannot install GRUB bootloader. Aborting.
++"
++		exit 1
 +	fi
 +fi
-+
-+
- # Add entry for root filesystem to crypttab if needed
- if [[ $encrypt_os = yes ]] ; then
- 	echo -e $"\n Adding $install_part entry to crypttab...\n"
-@@ -1659,7 +1737,8 @@
+ 
+ 
+ #grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
+@@ -1659,7 +1878,8 @@
  
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -377,3 +806,18 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
+@@ -1918,6 +2138,14 @@
+ fi
+ 
+ 
++# Stop dual logging and do final sync
++if [[ -n "$_log_tail_pid" ]]; then
++	kill "$_log_tail_pid" 2>/dev/null
++	wait "$_log_tail_pid" 2>/dev/null
++fi
++# Final sync of error log to target
++[[ -n "$_target_error_log" ]] && cp "$error_log" "$_target_error_log" 2>/dev/null
++
+ # copy error log to installation before calling cleanup function
+ cp "$error_log" /target/home/"$newusername"/
+ chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
