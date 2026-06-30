@@ -46,7 +46,7 @@ A standard unified diff that patches both the GUI and CLI versions of refractain
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 ```
 
-The patch has evolved through seven versions:
+The patch has evolved through nine versions:
 
 #### v1 — btrfs filesystem support
 
@@ -177,6 +177,29 @@ For each, it writes `RESUME=UUID=<dev>` to `/etc/initramfs-tools/conf.d/resume` 
 
 > **VirtualBox caveat:** S4/hibernation generally does **not** work under VirtualBox (its EFI/ACPI doesn't reliably trigger the kernel's resume). Everything is configured correctly, but test actual hibernate/restore on **bare metal**.
 
+#### v8 — in-tool manifest help (discoverable without this README)
+
+The manifest-driven flow is now explained from inside the installer, so a user who has never seen this README can understand and use it:
+
+- **CLI:** `refractainstaller --btrfs-manifest` prints an explanation of the flow, an example `.refracta-btrfs-layout`, and a copy-pasteable recipe that creates the partitions' subvolumes + a valid (real-TAB) manifest. It's also listed in `refractainstaller --help`.
+- **GUI:** an **"Explain btrfs subvolumes"** button on the Partitioning page (next to *Run GParted*) shows the same text in a scrollable window. That page now loops, so closing the help returns you to it.
+
+Both share the same wording, and the recipe shown was verified to parse correctly through the installer's own manifest reader.
+
+#### v9 — guided disk setup + disk-state first screen (GUI)
+
+So you no longer have to run a disk-prep script separately, the GUI can build the disk itself — and it now states its destructive potential up front.
+
+- **Disk-state first screen:** before anything else, `refractainstaller-gui` shows a disk inventory (`lsblk`), detects and labels the **live boot medium**, and warns that some choices erase a whole disk — then Continue/Exit.
+- **"Auto-create btrfs layout" button** on the Partitioning page (single disk): lists eligible whole disks (**excluding the live medium and any mounted disk**), requires you to **type the device path** to confirm, then partitions ESP + `/boot` + btrfs(subvolumes) and writes the manifest — after which the install continues non-interactively over the "Do not format" path (the manifest is learned). Requires a UEFI boot; not combined with encryption.
+- **Shared library `btrfs-disk-lib.sh`** (installed to `/usr/lib/refractainstaller/`): the single source of truth for the layout + partition/manifest logic, used by both the guided GUI mode and the standalone `disk_setup_for_btrfs_desktop_subvolumes.sh`. Change the layout in one place.
+
+The CLI installer is unchanged in v9 (guided mode is GUI-only); manual partitioning and the existing "Do not format" path are untouched — guided mode is purely additive and opt-in.
+
+### `btrfs-disk-lib.sh`
+
+Shared library defining `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume layout), the manifest filename, and the functions that partition a disk, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside the script). Edit the layout here and both the installer's guided mode and the standalone script follow.
+
 ### `disk_setup_for_btrfs_desktop_plain.sh` / `disk_setup_for_btrfs_desktop_subvolumes.sh`
 
 **Disk partitioning scripts. Run from the Refracta live ISO on the target machine before running refractainstaller.** Pick one:
@@ -260,12 +283,13 @@ Ownership of `/etc/skel` is set to `root:root` after copying. The live system re
 │  TARGET MACHINE (VirtualBox or bare metal)              │
 │                                                         │
 │  1. Boot from the ISO                                   │
-│  2. sudo bash disk_setup_for_btrfs_desktop_subvolumes.sh│
-│       (or _plain.sh; writes the layout manifest)        │
-│  3. Run refractainstaller-gui                           │
-│     → "Do not format": installer learns the layout      │
-│     → or select "btrfs (with subvolumes)" to format     │
-│  4. Reboot — system boots with EFI fallback bootloader  │
+│  2. Run refractainstaller-gui                           │
+│     → first screen shows disk state + warning           │
+│     → Partitioning page: "Auto-create btrfs layout"     │
+│       builds ESP+/boot+subvolumes+manifest for you,     │
+│       OR prep manually (GParted / disk_setup_*.sh) and  │
+│       use "Do not format" so it learns the layout       │
+│  3. Reboot — system boots with EFI fallback bootloader  │
 └─────────────────────────────────────────────────────────┘
 ```
 

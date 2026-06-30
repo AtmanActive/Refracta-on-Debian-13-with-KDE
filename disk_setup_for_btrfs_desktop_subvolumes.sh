@@ -1,51 +1,24 @@
 #!/usr/bin/env bash
 
 # ══════════════════════════════════════════════════════════════════════════════
-# disk_setup.sh
-# Creates a clean GPT partition table, formats all partitions, and creates
-# btrfs subvolumes on a blank 256GB disk.
+# disk_setup_for_btrfs_desktop_subvolumes.sh
+# Creates a clean GPT partition table, formats all partitions, creates btrfs
+# subvolumes, and writes the layout manifest the patched refractainstaller reads.
+#
+# The actual layout + work lives in the SHARED library btrfs-disk-lib.sh (the
+# single source of truth, also used by refractainstaller's "Auto-create btrfs
+# layout" guided mode). This script is the standalone CLI wrapper around it.
 #
 # Target layout:
-#   p1  1024M    EF00  FAT32   /boot/efi
-#   p2  1024M    8300  ext4    /boot
-#   p3  ~253G    8300  btrfs   / (subvolumes: @rootfs @home @var_log @var_cache @libvirt_images @swap @tmp @snapshots)
+#   p1  1024M  EF00  FAT32  /boot/efi
+#   p2  1024M  8300  ext4   /boot
+#   p3  ~rest  8300  btrfs  /  (subvolumes per REFRACTA_BTRFS_LAYOUT)
 #
-# Run from a Refracta live ISO on a blank disk.
+# Run from a Refracta live ISO on the disk you want to erase.
 # ══════════════════════════════════════════════════════════════════════════════
-
-# https://github.com/flaksit/convert-btrfs-structure
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DISK="/dev/nvme0n1"
-
-# Partition sizes (MiB)
-EFI_SIZE_MiB=1024
-BOOT_SIZE_MiB=1024
-# p3 takes all remaining space automatically
-
-# ── btrfs subvolume layout ──────────────────────────────────────────────────────
-# Single source of truth: "<subvolume>:<mountpoint>", shallow paths first so that
-# parent mounts precede children. This exact mapping is written to a manifest on
-# the disk (see Step 4), which the patched refractainstaller READS to learn the
-# layout automatically — nothing about the scheme is hard-coded in the installer.
-BTRFS_LAYOUT=(
-    "@rootfs:/"
-    "@home:/home"
-    "@var_log:/var/log"
-    "@var_cache:/var/cache"
-    "@libvirt_images:/var/lib/libvirt/images"
-    "@swap:/swap"
-    "@tmp:/tmp"
-    "@snapshots:/.snapshots"
-)
-
-# Name of the layout manifest written at the btrfs top level (subvolid=5).
-# MUST match $btrfs_layout_manifest in the patched refractainstaller.
-MANIFEST_NAME=".refracta-btrfs-layout"
-
-# Derived list of subvolume names (for creation/iteration).
-BTRFS_SUBVOLS=()
-for _e in "${BTRFS_LAYOUT[@]}"; do BTRFS_SUBVOLS+=( "${_e%%:*}" ); done
 
 # ── Colour output ──────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -55,30 +28,43 @@ warn()    { echo -e "${YELLOW}WARNING:${RESET} $*"; }
 err()     { echo -e "${RED}ERROR:${RESET} $*"; }
 section() { echo -e "\n${BOLD}━━━ $* ━━━${RESET}\n"; }
 
+# ── Load the shared library (single source of truth) ───────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB=""
+for _cand in /usr/lib/refractainstaller/btrfs-disk-lib.sh "$SCRIPT_DIR/btrfs-disk-lib.sh"; do
+    [ -f "$_cand" ] && { LIB="$_cand"; break; }
+done
+if [ -z "$LIB" ]; then
+    err "btrfs-disk-lib.sh not found (looked in /usr/lib/refractainstaller and $SCRIPT_DIR)."
+    err "Apply the refractainstaller btrfs patch, or keep btrfs-disk-lib.sh next to this script."
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$LIB"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Sanity Checks
 # ══════════════════════════════════════════════════════════════════════════════
 section "Sanity Checks"
 
 if [ "$EUID" -ne 0 ]; then
-    err "This script must be run as root. Use: sudo bash disk_setup.sh"
+    err "This script must be run as root. Use: sudo bash $(basename "$0")"
     exit 1
 fi
 
-for CMD in sgdisk mkfs.fat mkfs.ext4 mkfs.btrfs btrfs partprobe; do
-    if ! command -v "$CMD" &>/dev/null; then
-        err "Required command not found: $CMD"
-        err "Install with: apt-get install gdisk dosfstools e2fsprogs btrfs-progs"
-        exit 1
-    fi
-done
+if ! refracta_btrfs_check_tools 2>/tmp/.refracta_tools_missing; then
+    err "Required command(s) not found:$(cut -d: -f2 /tmp/.refracta_tools_missing)"
+    err "Install with: apt-get install gdisk dosfstools e2fsprogs btrfs-progs"
+    rm -f /tmp/.refracta_tools_missing
+    exit 1
+fi
+rm -f /tmp/.refracta_tools_missing
 
 if [ ! -b "$DISK" ]; then
-    err "Disk device '$DISK' not found."
+    err "Disk device '$DISK' not found. Edit DISK= at the top of this script."
     exit 1
 fi
 
-# Show what we are about to destroy
 log "Target disk: $DISK"
 echo ""
 lsblk "$DISK" 2>/dev/null || true
@@ -95,160 +81,44 @@ if [ "$CONFIRM" != "YES" ]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Wipe existing partition table
+# Create the layout (delegated to the shared library)
 # ══════════════════════════════════════════════════════════════════════════════
-section "Step 1: Wipe Existing Partition Table"
+section "Creating btrfs layout on $DISK"
 
-log "Wiping existing signatures and partition table on $DISK..."
-sudo wipefs --all --force "$DISK"
-sudo sgdisk --zap-all "$DISK"
-ok "Disk wiped."
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Create GPT Partition Table and Partitions
-# ══════════════════════════════════════════════════════════════════════════════
-section "Step 2: Create GPT Partitions"
-
-log "Creating partition layout..."
-
-sudo sgdisk \
-    --new=1:0:+${EFI_SIZE_MiB}M  --typecode=1:EF00  --change-name=1:"EFI System"    \
-    --new=2:0:+${BOOT_SIZE_MiB}M --typecode=2:8300  --change-name=2:"Linux boot"    \
-    --new=3:0:0                  --typecode=3:8300  --change-name=3:"Linux btrfs"   \
-    "$DISK"
-
-if [ $? -ne 0 ]; then
-    err "sgdisk partitioning failed. Aborting."
+if ! refracta_btrfs_make_layout "$DISK"; then
+    err "Disk setup failed. See messages above."
     exit 1
 fi
-ok "GPT partition table created."
-
-log "Informing kernel of new partition layout..."
-sudo partprobe "$DISK"
-sleep 3
-
-# Confirm all three partition nodes are visible
-for PART in 1 2 3; do
-    PART_DEV="${DISK}p${PART}"
-    RETRIES=0
-    while [ ! -b "$PART_DEV" ] && [ $RETRIES -lt 10 ]; do
-        sleep 1
-        RETRIES=$((RETRIES + 1))
-    done
-    if [ ! -b "$PART_DEV" ]; then
-        err "Partition device $PART_DEV did not appear after 10s. Aborting."
-        exit 1
-    fi
-done
-ok "All partition device nodes confirmed present."
-
-# Print final partition layout for review
-echo ""
-log "Partition layout:"
-sudo sgdisk --print "$DISK"
+ok "Disk setup complete."
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Format Partitions
+# Verification Summary
 # ══════════════════════════════════════════════════════════════════════════════
-section "Step 3: Format Partitions"
-
-EFI_PART="${DISK}p1"
-BOOT_PART="${DISK}p2"
-BTRFS_PART="${DISK}p3"
-
-# ── p1 → FAT32 (EFI) ──────────────────────────────────────────────────────────
-log "Formatting $EFI_PART as FAT32 (EFI System Partition)..."
-sudo mkfs.fat -F32 -n "EFI" "$EFI_PART"
-if [ $? -ne 0 ]; then err "mkfs.fat failed on $EFI_PART. Aborting."; exit 1; fi
-ok "FAT32 created on $EFI_PART (label: EFI)"
-
-# ── p2 → ext4 (/boot) ─────────────────────────────────────────────────────────
-log "Formatting $BOOT_PART as ext4 (/boot)..."
-sudo mkfs.ext4 -L "boot" "$BOOT_PART"
-if [ $? -ne 0 ]; then err "mkfs.ext4 failed on $BOOT_PART. Aborting."; exit 1; fi
-ok "ext4 created on $BOOT_PART (label: boot)"
-
-# ── p3 → btrfs (/) ────────────────────────────────────────────────────────────
-log "Formatting $BTRFS_PART as btrfs (root pool)..."
-sudo mkfs.btrfs --label "btrfs-root" --force "$BTRFS_PART"
-if [ $? -ne 0 ]; then err "mkfs.btrfs failed on $BTRFS_PART. Aborting."; exit 1; fi
-ok "btrfs created on $BTRFS_PART (label: btrfs-root)"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Create btrfs Subvolumes
-# ══════════════════════════════════════════════════════════════════════════════
-section "Step 4: Create btrfs Subvolumes"
-
-# Mount the top-level btrfs volume (subvolid=5, the root of the btrfs pool)
-# to create subvolumes. This is a temporary mount — not the final system mount.
-BTRFS_TOP=$(mktemp -d)
-log "Mounting btrfs top-level volume at $BTRFS_TOP..."
-sudo mount -o subvolid=5 "$BTRFS_PART" "$BTRFS_TOP"
-if [ $? -ne 0 ]; then
-    err "Could not mount $BTRFS_PART. Aborting."
-    rmdir "$BTRFS_TOP"
-    exit 1
-fi
-
-for SUBVOL in "${BTRFS_SUBVOLS[@]}"; do
-    log "Creating subvolume: $SUBVOL"
-    sudo btrfs subvolume create "$BTRFS_TOP/$SUBVOL"
-    if [ $? -eq 0 ]; then
-        ok "Subvolume created: $SUBVOL"
-    else
-        err "Failed to create subvolume: $SUBVOL"
-        sudo umount "$BTRFS_TOP"
-        rmdir "$BTRFS_TOP"
-        exit 1
-    fi
-done
-
-log "Listing all subvolumes:"
-sudo btrfs subvolume list "$BTRFS_TOP"
-
-# ── Write the layout manifest ────────────────────────────────────────────────
-# The patched refractainstaller reads this file at the btrfs top level to LEARN
-# the subvolume -> mountpoint mapping, so the installer never hard-codes it.
-log "Writing layout manifest: $MANIFEST_NAME"
-{
-    echo "# Refracta btrfs subvolume layout"
-    echo "# <subvolume><TAB><mountpoint> — read by refractainstaller"
-    for _e in "${BTRFS_LAYOUT[@]}"; do
-        printf '%s\t%s\n' "${_e%%:*}" "${_e#*:}"
-    done
-} | sudo tee "$BTRFS_TOP/$MANIFEST_NAME" >/dev/null
-ok "Manifest written to top-level (subvolid=5)/$MANIFEST_NAME"
-
-log "Unmounting temporary btrfs mount..."
-sudo umount "$BTRFS_TOP"
-rmdir "$BTRFS_TOP"
-ok "All btrfs subvolumes created and mount cleaned up."
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — Verify and Summary
-# ══════════════════════════════════════════════════════════════════════════════
-section "Step 5: Verification Summary"
+section "Verification Summary"
 
 echo -e "${BOLD}Block device layout:${RESET}"
 lsblk -f "$DISK"
 echo ""
-
 echo -e "${BOLD}Partition details:${RESET}"
-sudo sgdisk --print "$DISK"
+sgdisk --print "$DISK"
 echo ""
 
-ok "Disk setup complete."
-echo ""
+P1=$(refracta_part_name "$DISK" 1)
+P2=$(refracta_part_name "$DISK" 2)
+P3=$(refracta_part_name "$DISK" 3)
+
 echo -e "${BOLD}What was created:${RESET}"
 echo ""
-echo -e "  ${CYAN}${DISK}p1${RESET}  1024 MiB  FAT32   /boot/efi"
-echo -e "  ${CYAN}${DISK}p2${RESET}  1024 MiB  ext4    /boot"
-echo -e "  ${CYAN}${DISK}p3${RESET}  ~254 GiB  btrfs   / (root pool)"
+echo -e "  ${CYAN}${P1}${RESET}  1024 MiB  FAT32   /boot/efi"
+echo -e "  ${CYAN}${P2}${RESET}  1024 MiB  ext4    /boot"
+echo -e "  ${CYAN}${P3}${RESET}  ~rest     btrfs   / (root pool)"
 echo ""
-echo -e "  ${BOLD}btrfs subvolumes on ${DISK}p3:${RESET}"
-for _e in "${BTRFS_LAYOUT[@]}"; do
+echo -e "  ${BOLD}btrfs subvolumes on ${P3}:${RESET}"
+for _e in "${REFRACTA_BTRFS_LAYOUT[@]}"; do
     printf "    ${CYAN}%-18s${RESET}  →  %s\n" "${_e%%:*}" "${_e#*:}"
 done
+echo ""
+echo -e "  ${BOLD}layout manifest:${RESET} top-level (subvolid=5)/${REFRACTA_BTRFS_MANIFEST}"
 echo ""
 echo -e "${BOLD}Expected /etc/fstab entries after installation:${RESET}"
 echo ""
@@ -259,7 +129,7 @@ echo "  # boot"
 echo "  UUID=<uuid-of-p2>    /boot       ext4    defaults                0  2"
 echo ""
 echo "  # btrfs subvolumes (all share the SAME p3 UUID)"
-for _e in "${BTRFS_LAYOUT[@]}"; do
+for _e in "${REFRACTA_BTRFS_LAYOUT[@]}"; do
     printf "  UUID=<uuid-of-p3>    %-26s btrfs   defaults,noatime,subvol=%s\n" "${_e#*:}" "${_e%%:*}"
 done
 echo ""
@@ -269,11 +139,13 @@ echo ""
 echo -e "${YELLOW}NOTE:${RESET} All btrfs subvolume entries share the SAME UUID (they are all on"
 echo "       the same btrfs pool — just mounted via different subvol= options)."
 echo ""
-echo -e "${BOLD}Retrieve UUIDs with:${RESET}"
-echo -e "  ${CYAN}blkid $DISK*${RESET}"
+echo -e "${BOLD}Retrieve UUIDs with:${RESET}  ${CYAN}blkid $DISK*${RESET}"
 echo ""
 echo -e "${BOLD}Next step:${RESET} Launch refractainstaller-gui (btrfs patch applied)."
-echo "  Choose 'Do not format filesystems' and select ${DISK}p3 as root."
+echo "  Choose 'Do not format filesystems' and select ${P3} as root."
 echo "  The installer reads the manifest at the btrfs top level and LEARNS this"
 echo "  exact subvolume layout automatically — mounting each subvolume, writing"
 echo "  fstab, and creating the NoCoW swapfile in @swap. No manual mapping needed."
+echo ""
+echo -e "  (Or skip this script entirely and use the installer's"
+echo -e "   ${BOLD}\"Auto-create btrfs layout\"${RESET} button, which runs this same library.)"

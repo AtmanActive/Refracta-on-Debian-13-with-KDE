@@ -1,102 +1,59 @@
 From: Refracta user
-Date: 2026-06-29
-Subject: [PATCH v7] btrfs layout learning + RAM swap + hibernation + EFI fixes
+Date: 2026-06-30
+Subject: [PATCH v9] guided btrfs disk setup + disk-state first screen (GUI)
 
-This patch adds btrfs filesystem support to both the GUI (yad) and CLI
-versions of refractainstaller, makes the installer LEARN the btrfs subvolume
-layout from the disk, sizes swap to RAM and configures hibernation, fixes EFI
-partition mounting and grub installation, and mirrors the installer log to the
-target disk.
+Building on v1-v8 (btrfs layout learning, RAM-sized NoCoW swap, hibernation, EFI
+fixes, dual logging, in-tool manifest help), v9 lets refractainstaller-gui set up
+the disk itself instead of requiring a separate disk-prep script, and makes the
+program's destructive potential clear up front.
 
-Filesystem options added:
+New shared library:
 
-  1. "btrfs (single partition)" - formats the root partition as btrfs
-     without subvolumes. The top-level volume (subvolid=5) is mounted as /.
+  usr/lib/refractainstaller/btrfs-disk-lib.sh - the single source of truth for
+  the btrfs subvolume layout (REFRACTA_BTRFS_LAYOUT), the manifest filename, and
+  the functions that partition a disk (GPT: ESP + /boot + btrfs), create the
+  subvolumes, and write the .refracta-btrfs-layout manifest. Sourced by the GUI's
+  guided mode and by disk_setup_for_btrfs_desktop_subvolumes.sh.
 
-  2. "btrfs (with subvolumes)" - formats as btrfs, creates a set of
-     subvolumes, mounts each at its mountpoint before rsync, and writes
-     multiple fstab entries (all sharing one UUID with subvol= options).
+Disk-state first screen (GUI):
 
-Learning the layout from the disk:
+  Before anything else, refractainstaller-yad now shows a disk inventory (lsblk),
+  detects and labels the live boot medium, and warns that some choices erase a
+  whole disk - then Continue/Exit. This communicates intent before any action.
 
-  The disk-setup script writes a manifest at the btrfs top level (subvolid=5),
-  ".refracta-btrfs-layout", with one TAB-separated "<subvolume><TAB><mountpoint>"
-  line per subvolume. load_btrfs_layout() reads it (authoritative), or else
-  discovers existing subvolumes via `btrfs subvolume list` and guesses
-  mountpoints by convention (btrfs_guess_mount). Entries are sorted by
-  mountpoint depth so parents mount before children, and the root subvolume
-  (whichever maps to "/") is derived rather than assumed to be "@rootfs".
+Guided "Auto-create btrfs layout" (GUI, single disk):
 
-Swapfile (RAM-sized everywhere, NoCoW on btrfs):
+  A new button on the Partitioning page runs guided_btrfs_setup():
+    - lists eligible whole disks (excluding the live medium and mounted disks),
+    - requires the user to TYPE the device path to confirm destruction,
+    - calls the library to create ESP + /boot(ext4) + btrfs(subvolumes) + manifest,
+    - pre-sets install_dev/esp_dev/boot_dev + no_format=yes/sep_boot=yes/
+      use_uuid=yes/grub_dev=efi/uefi_boot=yes/must_choose_esp=no and a guided=yes
+      flag, then continues the install non-interactively over the "Do not format"
+      path (which learns the manifest just written).
+  Two interactive pickers are gated behind guided=yes (choose_boot, choose_root);
+  the others self-bypass via the pre-set variables. Requires a UEFI boot; refuses
+  otherwise. Encryption is not combined with guided mode.
 
-  The swapfile is sized to match the target's RAM (rounded up to a whole GiB),
-  auto-detected from /proc/meminfo at install time, for EVERY filesystem -
-  instead of the stock 256 MiB default (which rounds to 0 GiB in `free -g`).
-  It falls back to the configured size if RAM can't be read. On btrfs the
-  swapfile is additionally made NoCoW (chattr +C on an empty file before
-  writing); when the layout has a dedicated @swap subvolume the swapfile is
-  created inside it (e.g. /swap/swapfile). chmod precedes mkswap.
+Changes from v8:
+  - New usr/lib/refractainstaller/btrfs-disk-lib.sh (shared layout/partition lib).
+  - refractainstaller-yad: disk-state first screen; "Auto-create btrfs layout"
+    guided flow + guided=yes guards on choose_boot/choose_root.
+  - (refractainstaller CLI unchanged from v8; guided mode is GUI-only.)
 
-Hibernation (resume from swap), all scenarios:
-
-  configure_resume() sets the installed system up to resume from hibernation
-  for every swap scenario:
-    - swapfile on btrfs (incl. @swap subvolume): resume_offset is computed with
-      `btrfs inspect-internal map-swapfile -r`;
-    - swapfile on ext2/3/4: resume_offset is computed from `filefrag`;
-    - an existing swap partition: resume by UUID, no offset.
-  It writes RESUME=UUID=<dev> to /etc/initramfs-tools/conf.d/resume and appends
-  resume=UUID=<dev> [resume_offset=N] to GRUB_CMDLINE_LINUX_DEFAULT, then
-  update-grub + update-initramfs (the initramfs rebuild now also triggers when
-  resume is configured). For a swapfile, resume is only enabled if the offset
-  was obtained. Skipped for encrypted root (resuming from encrypted swap needs
-  extra setup). Note: hibernation generally does NOT work under VirtualBox;
-  test on bare metal.
-
-EFI boot fixes:
-
-  - ESP mount at /target/boot/efi has error checking (check_exit), mkdir -p,
-    a pre-unmount of the ESP from any existing mountpoint, and findmnt-based
-    verification (df does not list nested mounts).
-  - install_grub() verifies the ESP is mounted before grub-install.
-  - install_grub() no longer blindly re-mounts a separate /boot in the chroot.
-    With EFI + a separate /boot, the ESP-setup phase already mounts /boot (with
-    the ESP under it); the redundant chroot remount stacked a second /boot that
-    SHADOWED /boot/efi, making grub-install fail with "cannot find EFI
-    directory". A findmnt guard now skips the remount when /boot is already
-    mounted, while still mounting it for the BIOS / no-ESP path.
-
-Dual logging:
-
-  - A background tail -F mirrors the installer error log to the target disk in
-    real time; clean_log() (GUI) sanitizes passwords in both copies; a final
-    sync runs at the end of the install.
-
-Changes from v6:
-  - Added configure_resume(): hibernation resume= / resume_offset= +
-    initramfs RESUME for swapfile (btrfs and ext) and swap-partition installs;
-    update-initramfs now also runs when resume is configured.
-
-Changes from v5:
-  - install_grub(): findmnt guard around the chroot /boot remount.
-  - Swapfile sized to match RAM (whole GiB) on ALL filesystems; chmod before
-    mkswap.
-
-Changes from v4:
-  - load_btrfs_layout() + btrfs_guess_mount(): layout learned from an on-disk
-    manifest (or discovered), not hard-coded; root subvolume derived from it.
-  - The format-menu path writes the manifest into the new filesystem.
-  - btrfs swapfile created NoCoW and routed into @swap when present.
+Earlier:
+  v8 in-tool manifest help; v7 hibernation; v6 EFI /boot fix + RAM swap on all FS;
+  v5 manifest learning + NoCoW @swap; v1-v4 btrfs support, EFI mount fixes, dual log.
 
 Compatibility:
-  - ext2/ext3/ext4 paths gain RAM-sized swap + hibernation; otherwise unchanged.
-  - Encryption (LUKS) is not combined with btrfs, and hibernation is skipped
-    for encrypted root.
-  - btrfs-progs is required; checked at runtime with a friendly error.
+  - Manual partitioning (GParted / CLI tools) and the existing "Do not format"
+    path are unchanged; guided mode is purely additive and opt-in.
+  - btrfs-progs, gdisk, dosfstools, e2fsprogs required for guided mode (checked).
 
-Files patched:
-  usr/bin/refractainstaller-yad  (GUI version, 9.6.6)
-  usr/bin/refractainstaller      (CLI version, 9.6.6)
+Files patched/added:
+  usr/bin/refractainstaller-yad                    (GUI, 9.6.6)
+  usr/bin/refractainstaller                        (CLI, 9.6.6; unchanged vs v8)
+  usr/lib/refractainstaller/btrfs-disk-lib.sh      (new shared library)
 
 Apply with:
   patch -p1 < btrfs-support-for-refractainstaller.patch
@@ -192,7 +149,277 @@ Apply with:
  if [[ -f $configfile ]]; then
      source $configfile
  else
-@@ -851,10 +931,12 @@
+@@ -156,6 +236,42 @@
+ fi
+ 
+ 
++# First screen: disk-state detection + warning, BEFORE anything else.
++# Refracta installs the running live system onto a disk you prepare; some actions
++# here (especially the guided "Auto-create btrfs layout" option) erase a whole
++# disk. Detect and flag the live boot medium so the user never targets it.
++live_medium=""
++for _m in /run/live/medium /lib/live/mount/medium /usr/lib/live/mount/medium ; do
++	[[ -d "$_m" ]] || continue
++	_src=$(findmnt -n -o SOURCE --target "$_m" 2>/dev/null | head -1)
++	[[ -n "$_src" ]] || continue
++	_pk=$(lsblk -no PKNAME "$_src" 2>/dev/null | head -1)
++	[[ -n "$_pk" ]] && live_medium="/dev/$_pk" || live_medium="$_src"
++	break
++done
++
++{
++	echo "Refracta installs the RUNNING live system onto a disk that YOU prepare."
++	echo "Partitioning is your responsibility. Some choices in this installer ERASE"
++	echo "an entire disk and cannot be undone - read each warning carefully."
++	echo ""
++	if [[ -n "$live_medium" ]]; then
++		echo "Live boot medium (excluded from guided erase): $live_medium"
++		echo ""
++	fi
++	echo "Detected disks and their current state:"
++	echo ""
++	lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT,MODEL -e 7,11 2>/dev/null
++	echo ""
++	echo "Next you will see the license/greeting, the install options, and then the"
++	echo "Partitioning screen, where you can run GParted, view this layout help, or"
++	echo "let the installer auto-create a btrfs + subvolumes layout for you."
++} | yad --text-info --title=$"Disk state - please read before continuing" \
++	--fontname="Monospace" --width=840 --height=540 --center --borders=10 \
++	--wrap --button=$"Exit":1 --button=$"Continue":0
++if [[ $? -ne 0 ]] ; then exit 0 ; fi
++
++
+ # Greeting window
+ yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
+ 	--button=$"Continue":0 --button=$"Exit":1 \
+@@ -563,6 +679,67 @@
+ ## Partition a disk ##### 
+ 
+ 
++# Explain the manifest-driven btrfs subvolume install flow and show an example.
++show_btrfs_manifest () {
++cat <<'EOF' | yad --text-info --title=$"btrfs subvolume layout (manifest)" \
++  --fontname="Monospace" --width=780 --height=620 --center --borders=10 --button=$"Close":0
++
++ Refracta - btrfs subvolume layout via a manifest
++ ================================================
++
++ Install onto a btrfs disk that YOU partitioned and formatted, without the
++ installer reformatting it. The installer learns your subvolume layout from a
++ small manifest file on the disk, so any subvolume scheme works.
++
++ STEPS
++  1. Create partitions, run mkfs.btrfs, and create your subvolumes
++     (the "Run GParted" / CLI partitioner buttons help with partitions).
++  2. Put a manifest at the btrfs TOP LEVEL (subvolid=5), named:
++        .refracta-btrfs-layout
++     One line per subvolume:   <subvolume><TAB><mountpoint>
++     ('#' begins a comment. Columns MUST be separated by a real TAB.)
++  3. Back in the installer, tick "Do not format filesystems",
++     then choose your btrfs partition as the root device.
++
++ The installer then automatically:
++   - mounts each subvolume at its mountpoint (parents before children),
++   - uses the subvolume mapped to "/" as root,
++   - writes /etc/fstab (every subvolume shares the partition UUID),
++   - creates a RAM-sized, NoCoW swapfile in the @swap subvolume,
++   - configures hibernation (resume= / resume_offset=).
++ If no manifest is found but subvolumes exist, it falls back to discovering
++ them and guessing mountpoints from their names.
++
++ EXAMPLE  .refracta-btrfs-layout   (the gap in each line is a single TAB)
++   # <subvolume>        <mountpoint>
++   @rootfs              /
++   @home                /home
++   @var_log             /var/log
++   @var_cache           /var/cache
++   @libvirt_images      /var/lib/libvirt/images
++   @swap                /swap
++   @tmp                 /tmp
++   @snapshots           /.snapshots
++
++ CREATE IT BY HAND  (example device /dev/sdaX - adjust!)
++   mkfs.btrfs -L btrfs-root /dev/sdaX
++   mount -o subvolid=5 /dev/sdaX /mnt
++   for s in @rootfs @home @var_log @var_cache @libvirt_images @swap @tmp @snapshots; do
++       btrfs subvolume create /mnt/$s
++   done
++   printf '%s\t%s\n' \
++     @rootfs / @home /home @var_log /var/log @var_cache /var/cache \
++     @libvirt_images /var/lib/libvirt/images @swap /swap \
++     @tmp /tmp @snapshots /.snapshots > /mnt/.refracta-btrfs-layout
++   umount /mnt
++
++ The project's disk_setup_for_btrfs_desktop_subvolumes.sh does all of the
++ above for you (partitions, subvolumes, and the manifest).
++
++EOF
++}
++
++
+ list_disks () {
+ 
+ 	env LC_ALL=C fdisk -l | egrep "^Disk|^/dev" > /tmp/diskinfo
+@@ -571,6 +748,103 @@
+ 	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
+ }
+ 
++# guided_btrfs_setup
++#   Whole-disk guided btrfs install. Pick a disk, type-to-confirm, then create
++#   ESP + /boot + btrfs(subvolumes) + manifest via btrfs-disk-lib.sh, and pre-set
++#   the installer variables so the rest of the install runs non-interactively over
++#   the "Do not format" path (which learns the manifest we just wrote).
++#   Returns 0 on success (caller should proceed), 1 if cancelled or it failed.
++guided_btrfs_setup () {
++	local _lib="/usr/lib/refractainstaller/btrfs-disk-lib.sh"
++	local _disk _confirm _p1 _p2 _p3 _log _feed _name _size _rest _dev
++
++	# Guided mode builds an EFI layout; require a UEFI boot.
++	if [[ ! -d /sys/firmware/efi ]]; then
++		yad --image=gtk-dialog-error --title=$"Auto-create btrfs layout" --center --borders=10 --button=$"OK":0 \
++		  --text=$"This guided setup creates an EFI layout, but the live system was not booted in UEFI mode.\n\nReboot in UEFI mode, or partition manually."
++		return 1
++	fi
++	if [[ ! -f "$_lib" ]]; then
++		yad --image=gtk-dialog-error --title=$"Auto-create btrfs layout" --center --borders=10 --button=$"OK":0 \
++		  --text=$"Missing $_lib\n\nThe btrfs disk library is not installed; cannot continue."
++		return 1
++	fi
++	source "$_lib"
++	if ! refracta_btrfs_check_tools 2>/tmp/refracta-tools.err ; then
++		yad --image=gtk-dialog-error --title=$"Auto-create btrfs layout" --center --borders=10 --button=$"OK":0 \
++		  --text=$"Required tools are missing:\n$(cat /tmp/refracta-tools.err)\n\nInstall: gdisk dosfstools e2fsprogs btrfs-progs"
++		return 1
++	fi
++
++	# Build eligible disks: exclude the live medium and any disk with mounted
++	# partitions. Emit yad --list cells (device, size, model) into a feed file.
++	_feed=$(mktemp)
++	while read -r _name _size _rest; do
++		_dev="/dev/$_name"
++		[[ "$_dev" == "$live_medium" ]] && continue
++		lsblk -nr -o MOUNTPOINT "$_dev" 2>/dev/null | grep -q . && continue
++		printf '%s\n%s\n%s\n' "$_dev" "$_size" "${_rest:-disk}" >> "$_feed"
++	done < <(lsblk -dn -o NAME,SIZE,MODEL -e 7,11 2>/dev/null)
++
++	if [[ ! -s "$_feed" ]]; then
++		rm -f "$_feed"
++		yad --image=gtk-dialog-error --title=$"Auto-create btrfs layout" --center --borders=10 --button=$"OK":0 \
++		  --text=$"No eligible disk found (the live medium and any mounted disks are excluded).\n\nUnmount disks or use GParted, then try again."
++		return 1
++	fi
++
++	_disk=$(yad --list --title=$"Select disk to ERASE" --center --borders=10 --width=620 --height=300 \
++		--separator="" --print-column=1 --column $"Device" --column $"Size" --column $"Model" \
++		--text=$"Select the disk to partition. ITS ENTIRE CONTENTS WILL BE DESTROYED.\nThe live boot medium and mounted disks are not listed." \
++		--button=$"Cancel":1 --button=$"Continue":0 < "$_feed")
++	local _rc=$?
++	rm -f "$_feed"
++	[[ $_rc -eq 0 && -n "$_disk" && -b "$_disk" ]] || return 1
++
++	_p1=$(refracta_part_name "$_disk" 1); _p2=$(refracta_part_name "$_disk" 2); _p3=$(refracta_part_name "$_disk" 3)
++
++	# Type-to-confirm: the user must type the exact device path.
++	_confirm=$(yad --entry --title=$"Confirm destruction" --center --borders=10 --width=560 \
++		--button=$"Cancel":1 --button=$"ERASE and create":0 \
++		--text=$"About to ERASE $_disk and create:\n   $_p1  1 GiB  FAT32  /boot/efi\n   $_p2  1 GiB  ext4   /boot\n   $_p3  rest   btrfs  / (subvolumes: ${REFRACTA_BTRFS_LAYOUT[*]%%:*})\n\nALL DATA ON $_disk WILL BE LOST.\nType the device path  $_disk  to confirm:")
++	[[ $? -eq 0 ]] || return 1
++	if [[ "$_confirm" != "$_disk" ]]; then
++		yad --image=gtk-dialog-error --title=$"Confirm destruction" --center --borders=10 --button=$"OK":0 \
++		  --text=$"What you typed did not match $_disk. Aborting - nothing was changed."
++		return 1
++	fi
++
++	# Do it (runs a few seconds), then show the log.
++	_log="/tmp/refracta-guided-disk.log"
++	if ! refracta_btrfs_make_layout "$_disk" >"$_log" 2>&1 ; then
++		yad --text-info --title=$"Auto-create btrfs layout FAILED" --center --borders=10 \
++		  --fontname="Monospace" --width=760 --height=480 --button=$"OK":0 < "$_log"
++		return 1
++	fi
++
++	# Pre-set installer variables so the rest of the install is non-interactive
++	# and uses the manifest we just wrote (Do-not-format -> load_btrfs_layout).
++	guided="yes"
++	install_dev="$_p3"
++	esp_dev="$_p1"
++	boot_dev="$_p2"
++	must_choose_esp="no"
++	uefi_boot="yes"
++	grub_dev="efi"
++	sep_boot="yes"
++	sep_home="no"
++	no_format="yes"
++	use_uuid="yes"
++	use_existing_swap="no"
++	encrypt_os="no"
++	encrypt_home="no"
++
++	yad --text-info --title=$"btrfs layout created" --center --borders=10 \
++	  --fontname="Monospace" --width=760 --height=420 --button=$"Continue":0 < "$_log"
++	return 0
++}
++
++
+ partition_disk () {
+ if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
+ 	cli_partition_tool="gdisk"
+@@ -578,20 +852,31 @@
+ 	cli_partition_tool="cfdisk"
+ fi
+ 
++while true ; do
+ yad --title=$"Partitioning" --button=$"Run GParted":0 --button=$"Run $cli_partition_tool":1 \
+-    --width=650 --button=$"Skip this step":2 --button=$"Exit":3 --center --borders=10 \
+-    --text=$"  You need to have at least one partition ready for the installation, plus one for each separate  
++    --width=780 --button=$"Explain btrfs subvolumes":4 --button=$"Auto-create btrfs layout":5 \
++    --button=$"Skip this step":2 --button=$"Exit":3 --center --borders=10 \
++    --text=$"  You need to have at least one partition ready for the installation, plus one for each separate
+   partition that you chose. If you already have the partition(s) ready, you can skip this step.
+ 
++  Installing onto an existing btrfs subvolume layout? Click \"Explain btrfs subvolumes\".
++
++  Or let the installer build it for you: \"Auto-create btrfs layout\" partitions a whole
++  disk into ESP + /boot + btrfs subvolumes and writes the manifest. THIS ERASES THAT DISK.
++
+   Run the partitioner now?"
+ 
+ 	ans="$?"
+ 	case $ans in
+-		0) 	gparted ;;
+-		1)  xterm -T "Close this terminal after partioning" -fa mono -fs 12 -geometry 90x25+0+0 -hold -e "$cli_partition_tool" ;;
+-		2)  ;;
++		0) 	gparted ; break ;;
++		1)  xterm -T "Close this terminal after partioning" -fa mono -fs 12 -geometry 90x25+0+0 -hold -e "$cli_partition_tool" ; break ;;
++		4)  show_btrfs_manifest ;;
++		5)  guided_btrfs_setup && break ;;
++		2)  break ;;
+ 		3) exit 0 ;;
++		*) break ;;
+ 	esac
++done
+ 
+ }
+ 
+@@ -778,7 +1063,7 @@
+ boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
+ }
+ 
+-if [[ $sep_boot = "yes" ]]; then
++if [[ $sep_boot = "yes" ]] && [[ $guided != "yes" ]]; then
+     choose_boot
+ fi
+ 
+@@ -845,16 +1130,20 @@
+ fi
+ }
+ 
+-choose_root
++if [[ $guided != "yes" ]] ; then
++	choose_root
++fi
+ 
+ 
  # Choose filesystem type for OS.
  choose_fs_os () {
  fs_type_os=$(yad --list --title=$"Root Filesystem" --center --borders=10 --text=$"What type of filesystem would you like on $install_dev?" \
@@ -207,7 +434,7 @@ Apply with:
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +949,48 @@
+@@ -867,10 +1156,48 @@
  fi  
  }
  
@@ -257,7 +484,7 @@ Apply with:
  fi
  
  
-@@ -1251,9 +1371,49 @@
+@@ -1251,9 +1578,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -309,7 +536,7 @@ Apply with:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +1493,70 @@
+@@ -1333,14 +1700,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -383,7 +610,7 @@ Apply with:
  fi
  
  
-@@ -1531,9 +1747,23 @@
+@@ -1531,9 +1954,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -408,7 +635,7 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +1824,12 @@
+@@ -1594,10 +2031,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -422,7 +649,7 @@ Apply with:
  fi
  
  
-@@ -1674,13 +1906,28 @@
+@@ -1674,13 +2113,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -454,7 +681,7 @@ Apply with:
  fi
  
  
-@@ -1690,13 +1937,57 @@
+@@ -1690,13 +2144,57 @@
  
  
   
@@ -515,7 +742,7 @@ Apply with:
  fi
  
  
-@@ -1836,7 +2127,8 @@
+@@ -1836,7 +2334,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -525,7 +752,7 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -2058,10 +2350,12 @@
+@@ -2058,10 +2557,12 @@
  	# clear the log of plain-text passwords
  	if [ -n "$newpass" ]; then
  		sed -i "s|$newpass|\*\*\*\*|"g $error_log
@@ -538,7 +765,7 @@ Apply with:
  	fi
  	newpass=""
  	confirm_newpass=""
-@@ -2166,6 +2460,14 @@
+@@ -2166,6 +2667,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
@@ -642,7 +869,88 @@ Apply with:
  
  show_help () {
  	programname="$0"
-@@ -685,12 +765,16 @@
+@@ -43,10 +123,69 @@
+ 		-h, --help		show this help text
+ 		-v, --version	display the version information
+ 		-d. --debug		debug mode
++		--btrfs-manifest	explain the btrfs subvolume manifest flow + example
+ 
+ "
+ }
+ 
++# Explain the manifest-driven btrfs subvolume install flow and show an example.
++show_btrfs_manifest () {
++cat <<'EOF'
++
++ Refracta - btrfs subvolume layout via a manifest
++ ================================================
++
++ Install onto a btrfs disk that YOU partitioned and formatted, without the
++ installer reformatting it. The installer learns your subvolume layout from a
++ small manifest file on the disk, so any subvolume scheme works.
++
++ STEPS
++  1. Create partitions, run mkfs.btrfs, and create your subvolumes.
++  2. Put a manifest at the btrfs TOP LEVEL (subvolid=5), named:
++        .refracta-btrfs-layout
++     One line per subvolume:   <subvolume><TAB><mountpoint>
++     ('#' begins a comment. Columns MUST be separated by a real TAB.)
++  3. Start the install and tick "Do not format filesystems",
++     then choose your btrfs partition as the root device.
++
++ The installer then automatically:
++   - mounts each subvolume at its mountpoint (parents before children),
++   - uses the subvolume mapped to "/" as root,
++   - writes /etc/fstab (every subvolume shares the partition UUID),
++   - creates a RAM-sized, NoCoW swapfile in the @swap subvolume,
++   - configures hibernation (resume= / resume_offset=).
++ If no manifest is found but subvolumes exist, it falls back to discovering
++ them and guessing mountpoints from their names.
++
++ EXAMPLE  .refracta-btrfs-layout   (the gap in each line is a single TAB)
++   # <subvolume>        <mountpoint>
++   @rootfs              /
++   @home                /home
++   @var_log             /var/log
++   @var_cache           /var/cache
++   @libvirt_images      /var/lib/libvirt/images
++   @swap                /swap
++   @tmp                 /tmp
++   @snapshots           /.snapshots
++
++ CREATE IT BY HAND  (example device /dev/sdaX - adjust!)
++   mkfs.btrfs -L btrfs-root /dev/sdaX
++   mount -o subvolid=5 /dev/sdaX /mnt
++   for s in @rootfs @home @var_log @var_cache @libvirt_images @swap @tmp @snapshots; do
++       btrfs subvolume create /mnt/$s
++   done
++   printf '%s\t%s\n' \
++     @rootfs / @home /home @var_log /var/log @var_cache /var/cache \
++     @libvirt_images /var/lib/libvirt/images @swap /swap \
++     @tmp /tmp @snapshots /.snapshots > /mnt/.refracta-btrfs-layout
++   umount /mnt
++
++ The project's disk_setup_for_btrfs_desktop_subvolumes.sh does all of the
++ above for you (partitions, subvolumes, and the manifest).
++
++EOF
++}
++
+ while [[ $1 == -* ]]; do
+ 	option="$1"
+ 	case "$option" in
+@@ -62,6 +201,10 @@
+ 		-d|--debug)
+ 			DEBUG="yes"
+ 			break ;;
++
++		--btrfs-manifest)
++			show_btrfs_manifest
++			exit 0 ;;
+ 		
+ 		*) echo $"
+ 	invalid option: $option \n\n
+@@ -685,12 +828,16 @@
  	2) ext2
  	3) ext3
  	4) ext4
@@ -659,7 +967,7 @@ Apply with:
  	    esac
  	done
  	
-@@ -755,12 +839,38 @@
+@@ -755,12 +902,38 @@
  }
  
  
@@ -699,7 +1007,7 @@ Apply with:
  
  # Enter device for /home partition or skip. If one is entered, test it.
  echo $"
-@@ -1138,11 +1248,48 @@
+@@ -1138,11 +1311,48 @@
  fi
  
  if [[ $no_format != "yes" ]]; then
@@ -751,7 +1059,7 @@ Apply with:
  
  # make mount point for separate home if needed
  # and add /home/* to the excludes list if it's not already there
-@@ -1222,14 +1369,71 @@
+@@ -1222,14 +1432,71 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -826,7 +1134,7 @@ Apply with:
  fi
  
  # Disallow mounting of all fixed drives with pmount
-@@ -1427,9 +1631,23 @@
+@@ -1427,9 +1694,23 @@
  	fi
  fi
  echo -e $"\n Creating /etc/fstab...\n"
@@ -851,7 +1159,7 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if [[ -n $home_part ]] ; then
-@@ -1463,10 +1681,12 @@
+@@ -1463,10 +1744,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -865,7 +1173,7 @@ Apply with:
  fi
  
  
-@@ -1524,9 +1744,17 @@
+@@ -1524,9 +1807,17 @@
  mount --bind /proc/ /target/proc/ ; check_exit 
  mount --bind /sys/ /target/sys/ ; check_exit 
  
@@ -885,7 +1193,7 @@ Apply with:
  fi
  
  # This test is not complete and should probably be done earlier. grub_dev="efi" above
-@@ -1543,15 +1771,68 @@
+@@ -1543,15 +1834,68 @@
  	fi
      echo -e $"\n Adding esp entry to fstab...\n"
      echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
@@ -957,7 +1265,7 @@ Apply with:
  
  
  #grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
-@@ -1658,8 +1939,10 @@
+@@ -1658,8 +2002,10 @@
  done
  
  
@@ -970,7 +1278,7 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1918,6 +2201,14 @@
+@@ -1918,6 +2264,14 @@
  fi
  
  
@@ -985,3 +1293,122 @@ Apply with:
  # copy error log to installation before calling cleanup function
  cp "$error_log" /target/home/"$newusername"/
  chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
+--- /dev/null
++++ b/usr/lib/refractainstaller/btrfs-disk-lib.sh
+@@ -0,0 +1,116 @@
++#!/usr/bin/env bash
++# ──────────────────────────────────────────────────────────────────────────────
++# btrfs-disk-lib.sh — shared Refracta btrfs disk-layout library
++#
++# Single source of truth for the btrfs subvolume layout + manifest, used by:
++#   - refractainstaller / refractainstaller-yad  (guided "Auto-create" mode)
++#   - disk_setup_for_btrfs_desktop_subvolumes.sh (standalone disk prep)
++#
++# It is SOURCED, not executed, and assumes the caller runs as root.
++# The patch installs a copy at /usr/lib/refractainstaller/btrfs-disk-lib.sh.
++# To change the layout, edit REFRACTA_BTRFS_LAYOUT here — both the installer and
++# the standalone script (and the manifest the installer learns) follow it.
++# ──────────────────────────────────────────────────────────────────────────────
++
++# subvolume:mountpoint — shallow paths first so parents mount before children.
++REFRACTA_BTRFS_LAYOUT=(
++    "@rootfs:/"
++    "@home:/home"
++    "@var_log:/var/log"
++    "@var_cache:/var/cache"
++    "@libvirt_images:/var/lib/libvirt/images"
++    "@swap:/swap"
++    "@tmp:/tmp"
++    "@snapshots:/.snapshots"
++)
++
++# Manifest filename written at the btrfs top level (subvolid=5).
++# MUST match $btrfs_layout_manifest in refractainstaller{,-yad}.
++REFRACTA_BTRFS_MANIFEST=".refracta-btrfs-layout"
++
++# Partition sizes (MiB). p3 (btrfs) takes the remaining space.
++REFRACTA_EFI_SIZE_MiB=1024
++REFRACTA_BOOT_SIZE_MiB=1024
++
++# refracta_part_name DISK N  ->  Nth partition device node.
++# Handles nvme0n1p1 / mmcblk0p1 (disk ends in a digit) vs sda1 (ends in a letter).
++refracta_part_name () {
++    local _disk="$1" _n="$2"
++    case "$_disk" in
++        *[0-9]) echo "${_disk}p${_n}" ;;
++        *)      echo "${_disk}${_n}" ;;
++    esac
++}
++
++# refracta_btrfs_check_tools  ->  0 if all needed tools are present, else 1.
++# On failure, prints the missing tool names to stderr.
++refracta_btrfs_check_tools () {
++    local _c _missing=""
++    for _c in sgdisk wipefs mkfs.fat mkfs.ext4 mkfs.btrfs btrfs partprobe blkid; do
++        command -v "$_c" >/dev/null 2>&1 || _missing="$_missing $_c"
++    done
++    [[ -z "$_missing" ]] && return 0
++    echo "missing tools:$_missing" >&2
++    return 1
++}
++
++# refracta_btrfs_manifest_lines  ->  prints the manifest body (comments + pairs).
++refracta_btrfs_manifest_lines () {
++    local _e
++    echo "# Refracta btrfs subvolume layout"
++    echo "# <subvolume><TAB><mountpoint> - read by refractainstaller"
++    for _e in "${REFRACTA_BTRFS_LAYOUT[@]}"; do
++        printf '%s\t%s\n' "${_e%%:*}" "${_e#*:}"
++    done
++}
++
++# refracta_btrfs_make_layout DISK
++#   DESTROYS DISK and creates the standard layout:
++#     p1  ESP   (FAT32, EF00)        p2  /boot (ext4, 8300)
++#     p3  btrfs (8300) with the subvolumes above + the layout manifest.
++#   Progress goes to stdout, errors to stderr. Returns 0 on success, 1 on error.
++#   Assumes root. Does NOT prompt — the CALLER must confirm the destruction.
++refracta_btrfs_make_layout () {
++    local _disk="$1" _efi _boot _btrfs _top _sv _e _i _p _r
++    [[ -b "$_disk" ]] || { echo "not a block device: $_disk" >&2; return 1; }
++    _efi=$(refracta_part_name "$_disk" 1)
++    _boot=$(refracta_part_name "$_disk" 2)
++    _btrfs=$(refracta_part_name "$_disk" 3)
++
++    echo "Wiping $_disk ..."
++    wipefs --all --force "$_disk" || { echo "wipefs failed on $_disk" >&2; return 1; }
++    sgdisk --zap-all "$_disk"     || { echo "sgdisk --zap-all failed on $_disk" >&2; return 1; }
++
++    echo "Creating GPT partitions on $_disk ..."
++    sgdisk \
++        --new=1:0:+${REFRACTA_EFI_SIZE_MiB}M  --typecode=1:EF00 --change-name=1:"EFI System" \
++        --new=2:0:+${REFRACTA_BOOT_SIZE_MiB}M --typecode=2:8300 --change-name=2:"Linux boot" \
++        --new=3:0:0                           --typecode=3:8300 --change-name=3:"Linux btrfs" \
++        "$_disk" || { echo "sgdisk partitioning failed on $_disk" >&2; return 1; }
++
++    partprobe "$_disk"; sleep 2
++    for _i in 1 2 3; do
++        _p=$(refracta_part_name "$_disk" "$_i"); _r=0
++        while [[ ! -b "$_p" && $_r -lt 10 ]]; do sleep 1; _r=$((_r+1)); done
++        [[ -b "$_p" ]] || { echo "partition $_p did not appear after 10s" >&2; return 1; }
++    done
++
++    echo "Formatting partitions ..."
++    mkfs.fat -F32 -n EFI "$_efi"                    || { echo "mkfs.fat failed on $_efi" >&2; return 1; }
++    mkfs.ext4 -F -L boot "$_boot"                   || { echo "mkfs.ext4 failed on $_boot" >&2; return 1; }
++    mkfs.btrfs --force --label btrfs-root "$_btrfs" || { echo "mkfs.btrfs failed on $_btrfs" >&2; return 1; }
++
++    echo "Creating subvolumes and writing the manifest ..."
++    _top=$(mktemp -d)
++    mount -o subvolid=5 "$_btrfs" "$_top" || { echo "mount subvolid=5 failed on $_btrfs" >&2; rmdir "$_top"; return 1; }
++    for _e in "${REFRACTA_BTRFS_LAYOUT[@]}"; do
++        _sv="${_e%%:*}"
++        btrfs subvolume create "$_top/$_sv" || { echo "subvolume create failed: $_sv" >&2; umount "$_top"; rmdir "$_top"; return 1; }
++    done
++    refracta_btrfs_manifest_lines > "$_top/$REFRACTA_BTRFS_MANIFEST"
++    sync
++    umount "$_top"; rmdir "$_top"
++
++    echo "Done: $_disk -> p1 ESP, p2 /boot (ext4), p3 btrfs + ${#REFRACTA_BTRFS_LAYOUT[@]} subvolumes + manifest"
++    return 0
++}
