@@ -1,59 +1,57 @@
 From: Refracta user
 Date: 2026-06-30
-Subject: [PATCH v9] guided btrfs disk setup + disk-state first screen (GUI)
+Subject: [PATCH v10] intro mode-fork: automated blank-disk vs custom (GUI)
 
-Building on v1-v8 (btrfs layout learning, RAM-sized NoCoW swap, hibernation, EFI
-fixes, dual logging, in-tool manifest help), v9 lets refractainstaller-gui set up
-the disk itself instead of requiring a separate disk-prep script, and makes the
-program's destructive potential clear up front.
+Building on v1-v9, v10 makes the guided/expert division explicit in the GUI and
+adds a fully automated blank-disk path, plus a guided-vs-encryption safeguard.
 
-New shared library:
+Installation-type dialog (right after the greeting):
 
-  usr/lib/refractainstaller/btrfs-disk-lib.sh - the single source of truth for
-  the btrfs subvolume layout (REFRACTA_BTRFS_LAYOUT), the manifest filename, and
-  the functions that partition a disk (GPT: ESP + /boot + btrfs), create the
-  subvolumes, and write the .refracta-btrfs-layout manifest. Sourced by the GUI's
-  guided mode and by disk_setup_for_btrfs_desktop_subvolumes.sh.
+  refractainstaller-gui now asks, up front:
+    - "Automated btrfs install" - for a machine with a BLANK disk. Wipes one
+      blank disk, builds the EFI + /boot + btrfs-subvolume layout automatically,
+      and installs, skipping BOTH the expert-options screen and the partitioning
+      screen. Requires a UEFI boot; refuses if there is no blank disk.
+    - "Custom - all options" - the installer behaves exactly as before (manual
+      partitioning / "Do not format", full expert options, the Partitioning
+      page with its "Auto-create btrfs layout" and "Explain btrfs subvolumes"
+      buttons).
 
-Disk-state first screen (GUI):
+Automated disk selection (guided_auto_setup):
 
-  Before anything else, refractainstaller-yad now shows a disk inventory (lsblk),
-  detects and labels the live boot medium, and warns that some choices erase a
-  whole disk - then Continue/Exit. This communicates intent before any action.
+  - exactly one blank disk        -> used automatically;
+  - several disks, one blank      -> that blank disk used automatically;
+  - more than one blank disk      -> the user picks from the blank disks.
+  A blank disk = no partitions, no partition table, no filesystem signature; the
+  live boot medium and mounted disks are always excluded. One confirmation, then
+  the shared btrfs-disk-lib.sh partitions the disk and the guided variables are
+  set so the rest of the install runs non-interactively (learns the manifest).
+  In automated mode the "create an EFI partition" notice is also suppressed
+  (the setup creates the ESP itself).
 
-Guided "Auto-create btrfs layout" (GUI, single disk):
+Guided-vs-encryption safeguard:
 
-  A new button on the Partitioning page runs guided_btrfs_setup():
-    - lists eligible whole disks (excluding the live medium and mounted disks),
-    - requires the user to TYPE the device path to confirm destruction,
-    - calls the library to create ESP + /boot(ext4) + btrfs(subvolumes) + manifest,
-    - pre-sets install_dev/esp_dev/boot_dev + no_format=yes/sep_boot=yes/
-      use_uuid=yes/grub_dev=efi/uefi_boot=yes/must_choose_esp=no and a guided=yes
-      flag, then continues the install non-interactively over the "Do not format"
-      path (which learns the manifest just written).
-  Two interactive pickers are gated behind guided=yes (choose_boot, choose_root);
-  the others self-bypass via the pre-set variables. Requires a UEFI boot; refuses
-  otherwise. Encryption is not combined with guided mode.
+  If encryption (root or /home) was selected and the user then triggers a guided
+  btrfs setup, the installer now REFUSES with an explanation instead of building
+  an inconsistent layout (btrfs subvolumes/swap/hibernation are not set up on
+  LUKS). Uncheck encryption for guided btrfs, or partition manually for ext+LUKS.
 
-Changes from v8:
-  - New usr/lib/refractainstaller/btrfs-disk-lib.sh (shared layout/partition lib).
-  - refractainstaller-yad: disk-state first screen; "Auto-create btrfs layout"
-    guided flow + guided=yes guards on choose_boot/choose_root.
-  - (refractainstaller CLI unchanged from v8; guided mode is GUI-only.)
+Refactor:
 
-Earlier:
-  v8 in-tool manifest help; v7 hibernation; v6 EFI /boot fix + RAM swap on all FS;
-  v5 manifest learning + NoCoW @swap; v1-v4 btrfs support, EFI mount fixes, dual log.
+  guided_btrfs_setup (v9, Partitioning-page button) and the new guided_auto_setup
+  share _guided_set_vars() so the pre-set variable contract lives in one place.
 
-Compatibility:
-  - Manual partitioning (GParted / CLI tools) and the existing "Do not format"
-    path are unchanged; guided mode is purely additive and opt-in.
-  - btrfs-progs, gdisk, dosfstools, e2fsprogs required for guided mode (checked).
+Changes from v9:
+  - refractainstaller-yad: installation-type dialog (auto_mode); guided_auto_setup
+    with blank-disk auto-selection; expert-options + partitioning screens skipped
+    in automated mode; EFI-partition notice suppressed in automated mode;
+    encryption-conflict refusal in guided setup; shared _guided_set_vars().
+  - (refractainstaller CLI and btrfs-disk-lib.sh unchanged from v9.)
 
 Files patched/added:
   usr/bin/refractainstaller-yad                    (GUI, 9.6.6)
   usr/bin/refractainstaller                        (CLI, 9.6.6; unchanged vs v8)
-  usr/lib/refractainstaller/btrfs-disk-lib.sh      (new shared library)
+  usr/lib/refractainstaller/btrfs-disk-lib.sh      (shared library; unchanged vs v9)
 
 Apply with:
   patch -p1 < btrfs-support-for-refractainstaller.patch
@@ -192,10 +190,189 @@ Apply with:
  # Greeting window
  yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
  	--button=$"Continue":0 --button=$"Exit":1 \
-@@ -563,6 +679,67 @@
- ## Partition a disk ##### 
+@@ -179,6 +295,134 @@
+ # Fix root's path (for Buster/Beowulf and later)
+ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ 
++# ── Guided / automated btrfs helpers ─────────────────────────────────────────
++
++# Set the installer variables for a guided/automated btrfs install so the rest
++# of the flow runs non-interactively over the "Do not format" path.
++_guided_set_vars () {   # $1=esp part  $2=boot part  $3=root part
++	guided="yes"
++	esp_dev="$1"; boot_dev="$2"; install_dev="$3"
++	must_choose_esp="no"; uefi_boot="yes"; grub_dev="efi"
++	sep_boot="yes"; sep_home="no"; no_format="yes"; use_uuid="yes"
++	use_existing_swap="no"; encrypt_os="no"; encrypt_home="no"
++}
++
++# _disk_is_blank DEV  ->  0 if DEV has no partitions, no partition table, and no
++# filesystem signature (i.e. safe to treat as an empty disk).
++_disk_is_blank () {
++	local _d="$1"
++	[[ -b "$_d" ]] || return 1
++	[[ -n "$(lsblk -nr -o NAME "$_d" 2>/dev/null | tail -n +2)" ]] && return 1
++	[[ -n "$(lsblk -no PTTYPE "$_d" 2>/dev/null | tr -d '[:space:]')" ]] && return 1
++	[[ -n "$(lsblk -no FSTYPE "$_d" 2>/dev/null | tr -d '[:space:]')" ]] && return 1
++	blkid -p "$_d" >/dev/null 2>&1 && return 1
++	return 0
++}
++
++# _list_blank_disks  ->  one eligible blank whole-disk per line (excludes the
++# live boot medium and any disk that currently has mounted partitions).
++_list_blank_disks () {
++	local _n _dev
++	while read -r _n; do
++		_dev="/dev/$_n"
++		[[ "$_dev" == "$live_medium" ]] && continue
++		lsblk -nr -o MOUNTPOINT "$_dev" 2>/dev/null | grep -q . && continue
++		_disk_is_blank "$_dev" && echo "$_dev"
++	done < <(lsblk -dn -o NAME -e 7,11 2>/dev/null)
++}
++
++# guided_auto_setup
++#   Automated whole-disk btrfs install onto a BLANK disk: auto-select when there
++#   is exactly one blank disk, otherwise let the user pick among the blank disks;
++#   one confirmation; then partition via btrfs-disk-lib.sh and set the guided
++#   variables. Returns 0 on success, 1 on cancel/failure.
++guided_auto_setup () {
++	local _lib="/usr/lib/refractainstaller/btrfs-disk-lib.sh" _disk _log _feed _d
++	local -a _blanks
++	if [[ ! -d /sys/firmware/efi ]]; then
++		yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"OK":0 \
++		  --text=$"Automated install requires booting in UEFI mode."
++		return 1
++	fi
++	if [[ ! -f "$_lib" ]]; then
++		yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"OK":0 \
++		  --text=$"Missing $_lib - the btrfs disk library is not installed."
++		return 1
++	fi
++	source "$_lib"
++	if ! refracta_btrfs_check_tools 2>/tmp/refracta-tools.err ; then
++		yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"OK":0 \
++		  --text=$"Required tools are missing:\n$(cat /tmp/refracta-tools.err)\n\nInstall: gdisk dosfstools e2fsprogs btrfs-progs"
++		return 1
++	fi
++
++	mapfile -t _blanks < <(_list_blank_disks)
++	if [[ ${#_blanks[@]} -eq 0 ]]; then
++		yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"OK":0 \
++		  --text=$"No blank disk was found. Free up a disk, or restart and choose the custom option."
++		return 1
++	elif [[ ${#_blanks[@]} -eq 1 ]]; then
++		_disk="${_blanks[0]}"
++	else
++		_feed=$(mktemp)
++		for _d in "${_blanks[@]}"; do
++			printf '%s\n%s\n%s\n' "$_d" "$(lsblk -dn -o SIZE "$_d" 2>/dev/null)" "$(lsblk -dn -o MODEL "$_d" 2>/dev/null)" >> "$_feed"
++		done
++		_disk=$(yad --list --title=$"Select blank disk" --center --borders=10 --width=620 --height=280 \
++			--separator="" --print-column=1 --column $"Device" --column $"Size" --column $"Model" \
++			--text=$"More than one blank disk was found. Choose the disk to use (it will be ERASED)." \
++			--button=$"Cancel":1 --button=$"Continue":0 < "$_feed")
++		rm -f "$_feed"
++		[[ -n "$_disk" && -b "$_disk" ]] || return 1
++	fi
++
++	yad --image=gtk-dialog-warning --title=$"Automated btrfs install" --center --borders=10 \
++	  --button=$"Cancel":1 --button=$"ERASE and install":0 \
++	  --text=$"Automated install will ERASE the following disk and set it up with an EFI + /boot + btrfs subvolume layout:\n\n        $_disk\n\nALL DATA ON $_disk WILL BE LOST. Continue?"
++	[[ $? -eq 0 ]] || return 1
++
++	_log="/tmp/refracta-guided-disk.log"
++	if ! refracta_btrfs_make_layout "$_disk" >"$_log" 2>&1 ; then
++		yad --text-info --title=$"Automated btrfs install FAILED" --center --borders=10 \
++		  --fontname="Monospace" --width=760 --height=480 --button=$"OK":0 < "$_log"
++		return 1
++	fi
++	_guided_set_vars "$(refracta_part_name "$_disk" 1)" "$(refracta_part_name "$_disk" 2)" "$(refracta_part_name "$_disk" 3)"
++	yad --text-info --title=$"btrfs layout created" --center --borders=10 \
++	  --fontname="Monospace" --width=760 --height=420 --button=$"Continue":0 < "$_log"
++	return 0
++}
++
++# ── Installation type: automated (blank disk) vs custom (all options) ─────────
++auto_mode="no"
++while true ; do
++	yad --title=$"Installation type" --center --borders=10 --width=680 \
++	  --button=$"Automated btrfs install":0 --button=$"Custom - all options":1 --button=$"Exit":2 \
++	  --text=$"How would you like to install?
++
++ * Automated btrfs install
++   For a machine with a BLANK disk. Wipes one blank disk and creates an
++   EFI + /boot + btrfs-subvolume layout automatically, then installs.
++   No partitioning and no expert questions. Requires a UEFI boot.
++
++ * Custom - all options
++   For existing or complex disk layouts. You partition the disk (or use
++   'Do not format' with a disk you prepared) and see every expert option."
++	case $? in
++		0)	if [[ ! -d /sys/firmware/efi ]]; then
++				yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"OK":0 \
++				  --text=$"Automated install requires booting in UEFI mode.\n\nUse 'Custom - all options', or reboot in UEFI mode."
++			elif [[ -z "$(_list_blank_disks)" ]]; then
++				yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"OK":0 \
++				  --text=$"No blank disk was detected (the live medium and mounted disks are excluded).\n\nUse 'Custom - all options', or free up a disk and try again."
++			else
++				auto_mode="yes"; break
++			fi ;;
++		1)	auto_mode="no"; break ;;
++		*)	exit 0 ;;
++	esac
++done
++
+ # function to exit the script if there are errors
+ check_exit () {
+ exit_code="$?"
+@@ -331,6 +575,9 @@
+ "
+ 	fi
+ 
++	# In automated mode the guided setup creates the ESP itself, so skip this
++	# "you need to create an EFI partition" notice.
++	if [[ $auto_mode != "yes" ]]; then
+ 	yad --title=$"$window_title" --width=480 --button=$"Help":0 \
+ 	--button=$"Continue":1 --button=$"Exit":2 --center --borders=10 \
+ 	--text=$"
+@@ -341,11 +588,12 @@
+ DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
+ 	"
+ 	answer="$?"
+-	case "$answer" in 
++	case "$answer" in
+ 		0) show_installer_help ;;
+ 		1) ;;
+ 		2) exit 0 ;;
+ 	esac
++	fi
+ else
+ 	# not uefi, do bios install.
+ 	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
+@@ -430,6 +678,9 @@
+ fi
  
  
++# In automated mode we skip the whole expert installation-options screen.
++if [[ $auto_mode != "yes" ]]; then
++
+ # Select installation options
+ 
+ opts=$(yad --list --title=$"Installation Options" --center --borders=10 \
+@@ -557,10 +808,73 @@
+         fi
+     fi
+     # end test for cryptsetup
+-fi    
++fi
++
++fi   # end: expert installation-options screen (skipped in automated mode)
+ 
+ 
+-## Partition a disk ##### 
++## Partition a disk #####
++
++
 +# Explain the manifest-driven btrfs subvolume install flow and show an example.
 +show_btrfs_manifest () {
 +cat <<'EOF' | yad --text-info --title=$"btrfs subvolume layout (manifest)" \
@@ -255,12 +432,10 @@ Apply with:
 +
 +EOF
 +}
-+
-+
- list_disks () {
  
- 	env LC_ALL=C fdisk -l | egrep "^Disk|^/dev" > /tmp/diskinfo
-@@ -571,6 +748,103 @@
+ 
+ list_disks () {
+@@ -571,6 +885,99 @@
  	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
  }
  
@@ -273,6 +448,15 @@ Apply with:
 +guided_btrfs_setup () {
 +	local _lib="/usr/lib/refractainstaller/btrfs-disk-lib.sh"
 +	local _disk _confirm _p1 _p2 _p3 _log _feed _name _size _rest _dev
++
++	# Guided btrfs setup does not support encryption: the subvolume + swapfile +
++	# hibernation layout is not built on LUKS, and resume-from-encrypted-swap needs
++	# setup this installer does not perform. Refuse rather than half-configure.
++	if [[ "$encrypt_os" = "yes" || "$encrypt_home" = "yes" ]]; then
++		yad --image=gtk-dialog-error --title=$"Auto-create btrfs layout" --center --borders=10 --button=$"OK":0 \
++		  --text=$"Guided btrfs setup cannot be combined with encryption.\n\nThe btrfs subvolume + swapfile + hibernation layout is not set up on an encrypted (LUKS) device, and resuming from encrypted swap needs extra configuration this installer does not perform.\n\n  - To use guided btrfs: go back and UNCHECK the encryption options.\n  - To use encryption: partition manually and choose an ext filesystem."
++		return 1
++	fi
 +
 +	# Guided mode builds an EFI layout; require a UEFI boot.
 +	if [[ ! -d /sys/firmware/efi ]]; then
@@ -340,20 +524,7 @@ Apply with:
 +
 +	# Pre-set installer variables so the rest of the install is non-interactive
 +	# and uses the manifest we just wrote (Do-not-format -> load_btrfs_layout).
-+	guided="yes"
-+	install_dev="$_p3"
-+	esp_dev="$_p1"
-+	boot_dev="$_p2"
-+	must_choose_esp="no"
-+	uefi_boot="yes"
-+	grub_dev="efi"
-+	sep_boot="yes"
-+	sep_home="no"
-+	no_format="yes"
-+	use_uuid="yes"
-+	use_existing_swap="no"
-+	encrypt_os="no"
-+	encrypt_home="no"
++	_guided_set_vars "$_p1" "$_p2" "$_p3"
 +
 +	yad --text-info --title=$"btrfs layout created" --center --borders=10 \
 +	  --fontname="Monospace" --width=760 --height=420 --button=$"Continue":0 < "$_log"
@@ -364,7 +535,7 @@ Apply with:
  partition_disk () {
  if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
  	cli_partition_tool="gdisk"
-@@ -578,20 +852,31 @@
+@@ -578,20 +985,31 @@
  	cli_partition_tool="cfdisk"
  fi
  
@@ -401,7 +572,26 @@ Apply with:
  
  }
  
-@@ -778,7 +1063,7 @@
+@@ -611,8 +1029,16 @@
+ fi
+ 
+ 
+-list_disks
+-partition_disk
++if [[ $auto_mode = "yes" ]]; then
++	if ! guided_auto_setup ; then
++		yad --image=gtk-dialog-error --title=$"Automated btrfs install" --center --borders=10 --button=$"Exit":0 \
++		  --text=$"Automated setup did not complete. Nothing further will be done."
++		exit 1
++	fi
++else
++	list_disks
++	partition_disk
++fi
+ 
+ ask_format_efi () {
+ 
+@@ -778,7 +1204,7 @@
  boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
  }
  
@@ -410,7 +600,7 @@ Apply with:
      choose_boot
  fi
  
-@@ -845,16 +1130,20 @@
+@@ -845,16 +1271,20 @@
  fi
  }
  
@@ -434,7 +624,7 @@ Apply with:
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +1156,48 @@
+@@ -867,10 +1297,48 @@
  fi  
  }
  
@@ -484,7 +674,7 @@ Apply with:
  fi
  
  
-@@ -1251,9 +1578,49 @@
+@@ -1251,9 +1719,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -536,7 +726,7 @@ Apply with:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +1700,70 @@
+@@ -1333,14 +1841,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -610,7 +800,7 @@ Apply with:
  fi
  
  
-@@ -1531,9 +1954,23 @@
+@@ -1531,9 +2095,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -635,7 +825,7 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2031,12 @@
+@@ -1594,10 +2172,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -649,7 +839,7 @@ Apply with:
  fi
  
  
-@@ -1674,13 +2113,28 @@
+@@ -1674,13 +2254,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -681,7 +871,7 @@ Apply with:
  fi
  
  
-@@ -1690,13 +2144,57 @@
+@@ -1690,13 +2285,57 @@
  
  
   
@@ -742,7 +932,7 @@ Apply with:
  fi
  
  
-@@ -1836,7 +2334,8 @@
+@@ -1836,7 +2475,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -752,7 +942,7 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -2058,10 +2557,12 @@
+@@ -2058,10 +2698,12 @@
  	# clear the log of plain-text passwords
  	if [ -n "$newpass" ]; then
  		sed -i "s|$newpass|\*\*\*\*|"g $error_log
@@ -765,7 +955,7 @@ Apply with:
  	fi
  	newpass=""
  	confirm_newpass=""
-@@ -2166,6 +2667,14 @@
+@@ -2166,6 +2808,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  

@@ -46,7 +46,7 @@ A standard unified diff that patches both the GUI and CLI versions of refractain
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 ```
 
-The patch has evolved through nine versions:
+The patch has evolved through ten versions:
 
 #### v1 — btrfs filesystem support
 
@@ -196,6 +196,15 @@ So you no longer have to run a disk-prep script separately, the GUI can build th
 
 The CLI installer is unchanged in v9 (guided mode is GUI-only); manual partitioning and the existing "Do not format" path are untouched — guided mode is purely additive and opt-in.
 
+#### v10 — intro mode-fork: automated vs custom (GUI)
+
+To make the guided/expert division obvious, `refractainstaller-gui` now asks, right after the greeting, **how** you want to install:
+
+- **Automated btrfs install** — for a machine with a **blank disk**. It skips **both** the expert-options screen and the Partitioning screen: it auto-selects the disk (one blank disk → used automatically; several disks but one blank → that one; more than one blank → you pick from the blank ones), asks for a single confirmation, then wipes it and builds EFI + `/boot` + btrfs-subvolumes + manifest and installs. A "blank disk" = no partitions, no partition table, no filesystem signature; the live medium and mounted disks are always excluded. Requires a UEFI boot (refuses otherwise), and the "create an EFI partition" notice is suppressed since the setup creates the ESP itself.
+- **Custom — all options** — the installer behaves exactly as before (full expert options, manual partitioning or "Do not format", and the Partitioning page's *Auto-create btrfs layout* / *Explain btrfs subvolumes* buttons).
+
+Also: **guided btrfs now refuses to combine with encryption** — if encryption (root or `/home`) is selected and you then trigger a guided btrfs setup, the installer stops with an explanation rather than building an inconsistent (non-LUKS) layout. Internally, the automated and Partitioning-page guided paths share one `_guided_set_vars()` so the variable contract lives in a single place. (CLI and `btrfs-disk-lib.sh` are unchanged in v10.)
+
 ### `btrfs-disk-lib.sh`
 
 Shared library defining `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume layout), the manifest filename, and the functions that partition a disk, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside the script). Edit the layout here and both the installer's guided mode and the standalone script follow.
@@ -284,11 +293,11 @@ Ownership of `/etc/skel` is set to `root:root` after copying. The live system re
 │                                                         │
 │  1. Boot from the ISO                                   │
 │  2. Run refractainstaller-gui                           │
-│     → first screen shows disk state + warning           │
-│     → Partitioning page: "Auto-create btrfs layout"     │
-│       builds ESP+/boot+subvolumes+manifest for you,     │
-│       OR prep manually (GParted / disk_setup_*.sh) and  │
-│       use "Do not format" so it learns the layout       │
+│     → disk-state screen (inventory + warning)           │
+│     → "Automated btrfs install" (blank disk): picks a   │
+│       blank disk + builds everything, no more questions │
+│     → or "Custom - all options": manual / Do not format │
+│       (GParted, disk_setup_*.sh, Auto-create button)    │
 │  3. Reboot — system boots with EFI fallback bootloader  │
 └─────────────────────────────────────────────────────────┘
 ```
