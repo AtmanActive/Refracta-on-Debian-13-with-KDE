@@ -37,8 +37,16 @@ PACKAGES=(
     "refracta2usb-2.4.3.deb|refracta2usb|2.4.3"
 )
 
-# Additional packages to install from apt repos (needed for btrfs workflow)
-EXTRA_APT_PACKAGES=( btrfs-progs )
+# Additional packages to install from apt repos (needed for the btrfs workflow).
+# None of these are declared by the Refracta .deb packages, yet the automated/
+# guided btrfs disk setup and the disk_setup_*.sh scripts require them:
+#   btrfs-progs -> mkfs.btrfs, btrfs   (btrfs filesystem, subvolumes, swapfile map)
+#   gdisk       -> sgdisk              (wipe + GPT-partition the target disk)
+#   parted      -> partprobe           (re-read the partition table after sgdisk)
+#   dosfstools  -> mkfs.fat            (format the EFI System Partition)
+# gdisk especially is NOT a dependency of any Refracta package, so without this
+# line it would have to be installed by hand.
+EXTRA_APT_PACKAGES=( btrfs-progs gdisk parted dosfstools )
 
 # File paths
 INITRAMFS_CONF="/etc/initramfs-tools/initramfs.conf"

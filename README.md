@@ -1,54 +1,206 @@
-# Refracta-on-Debian-13-with-KDE
+# Debian 13 to ISO and back
+### ( Refracta-on-Debian-13-with-KDE )
 
-Scripts to make [Refracta](https://sourceforge.net/projects/refracta/) work on Debian 13 (trixie) with KDE Plasma — pack a running operating system into a bootable ISO and install it on another machine.
+Scripts to make [Refracta](https://sourceforge.net/projects/refracta/) work on [Debian 13 (trixie)](https://www.debian.org/) with [KDE Plasma](https://kde.org/plasma-desktop/).
+Pack a running operating system into a bootable ISO and install it on another machine.
 
-## Background
+## Purpose
 
-The goal is to customize a Debian 13 + KDE Plasma desktop, then use Refracta to snapshot it into a live ISO and install that ISO on other machines (e.g. via VirtualBox for testing, then bare metal).
+The goal is to allow continuous customization of a Debian 13 + KDE Plasma desktop, while hopping from one machine to the next, including the Live ISO mode.
+This enables your operating system to remain yours, no matter how often you change hardware, or even ad-hoc from the Live CD/USB.
+Refracta is the software developed to snapshot a running operating system into a live ISO and install that ISO on other machines (e.g. via VirtualBox for testing, then bare metal).
 
-Two problems had to be solved:
+<details>
+<summary>But, for Refracta Installer, two problems had to be solved:</summary>
 
-1. **Refractainstaller only supports ext2/ext3/ext4.** There was no way to install onto btrfs, let alone btrfs with subvolumes — the installer would silently reformat a pre-created btrfs partition to ext4, destroying all subvolumes.
+1. **Refractainstaller v9.6.6 only supports ext2/ext3/ext4.** There was no way to install onto btrfs, let alone btrfs with subvolumes, the installer would silently reformat a pre-created btrfs partition to ext4, destroying all subvolumes.
 
-2. **The installed system would not boot under VirtualBox EFI.** Refractainstaller's default config does not create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, relying entirely on an NVRAM boot entry. VirtualBox's EFI NVRAM support is unreliable, and NVRAM does not travel with the disk — so the installed system could not boot. Additionally, the installer's EFI partition mounting logic had no error checking — if the ESP mount failed silently, `grub-install` would run with no ESP available and fail, but the error was non-obvious and the installer would continue.
+2. **The installed system would not boot under VirtualBox EFI.** Refractainstaller's default config does not create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, relying entirely on an NVRAM boot entry. Additionally, the installer's EFI partition mounting logic had no error checking. If the ESP mount failed silently, `grub-install` would run with no ESP available and fail, but the error was non-obvious and the installer would continue.
 
-These files solve both problems and automate the setup.
+This repository solves both problems and automates the whole flow: install and configure Refracta, patch the installer for btrfs (with subvolumes, RAM-sized swap, and hibernation), seed your desktop configuration into the ISO, and install onto btrfs on the target machine. Fully automated onto a blank disk, or with full manual control.
 
-## Files
+</details>
 
-### `install_and_prepare_refracta_on_debian13.sh`
+## How to use
 
-**One-time setup script. Run on the source machine (the one you'll snapshot).**
+<details>
+<summary><b>Prerequisites (informational)</b></summary>
 
-Downloads, installs, and configures all Refracta tools on a fresh Debian 13 x64 installation. Idempotent — safe to run multiple times; each step checks the current state and skips work already done.
+- **Debian 13 (trixie) x64** with **KDE Plasma 6**. The desktop only matters for the seed script — everything else works on any Debian 13.
+- **Root access** — the install script, the patch, and the target-side disk setup all write to system locations.
+- **Bootstrap tools**, already present on a standard Debian install, used to run the setup itself:
+  - `wget` — Step 1 downloads the Refracta `.deb`s with it.
+  - `patch` — applies `btrfs-support-for-refractainstaller.patch` (Step 2).
+  - `sudo`, and `initramfs-tools` (`update-initramfs`) — the latter rebuilds the initramfs for gzip compression and hibernation resume.
+- **Disk & filesystem tools for the btrfs workflow.** A base Debian system already ships the core utilities the installer leans on — `util-linux` (`lsblk`, `findmnt`, `blkid`, `wipefs`, `mkswap`), `e2fsprogs` (`mkfs.ext4`, `filefrag`, `chattr`), `coreutils`, `sed`, `grep`, and `grub` — and running Step 1's `apt-get install` on the Refracta `.deb`s automatically pulls in their declared dependencies: `rsync`, `squashfs-tools`, `xorriso`, `mawk`/`gawk`, `yad`, `gparted`, `xterm`, `live-boot`, `syslinux`/`isolinux`, and (as Recommends) `dosfstools` and `cryptsetup`. What Refracta does **not** declare — but the automated/guided btrfs disk setup and the standalone `disk_setup_*.sh` scripts need — are:
+  - **`gdisk`** (`sgdisk`) — wipes and GPT-partitions the target disk. This is the one true gap: it is **not a dependency of any Refracta package**, so on a stock system you must install it explicitly (`sudo apt-get install gdisk`).
+  - **`btrfs-progs`** (`mkfs.btrfs`, `btrfs`) — creates the btrfs filesystem and subvolumes and maps the swapfile for hibernation resume.
+  - **`parted`** (`partprobe`) — re-reads the partition table after `sgdisk`. Usually already present on a KDE desktop (pulled in by `udisks2`), but not guaranteed on a minimal base.
+  - **`dosfstools`** (`mkfs.fat`) — formats the EFI System Partition. A Refracta *Recommends*, so present unless you install with `--no-install-recommends`.
+
+  > Step 1's `install_and_prepare_refracta_on_debian13.sh` now installs `btrfs-progs`, `gdisk`, `parted`, and `dosfstools` for you, so you don't have to add them by hand — they are listed here so the requirement is explicit and so a minimal (non-desktop) base still works.
+
+</details>
+
+### On the source machine (the desktop you want to clone)
+
+#### Preparation (one time)
+
+**Preparation Step 1: Install and configure Refracta.**
 
 ```bash
 sudo bash install_and_prepare_refracta_on_debian13.sh
 ```
 
-What it does:
+A one-time, idempotent setup script (safe to re-run, each step checks state and skips work already done). 
+
+<details>
 
 1. **Downloads** the five Refracta `.deb` packages from SourceForge.
-2. **Installs** them via `apt-get install` (which resolves dependencies), plus `btrfs-progs` for btrfs support.
+2. **Installs** them via `apt-get install` (which resolves dependencies), plus `btrfs-progs`.
 3. **Holds** `refractainstaller-base` and `refractainstaller-gui` (`apt-mark hold`). These packages carry the btrfs patch and are installed manually from SourceForge `.deb`s, so no apt repository provides them and a normal `apt upgrade` will never touch them. The hold is a safeguard against a future apt-driven reinstall/upgrade (e.g. if Refracta ever lands in Debian's repos) silently overwriting the patched `/usr/bin/refractainstaller{,-yad}` with a stock version.
 4. **Sets `COMPRESS=gzip`** in `/etc/initramfs-tools/initramfs.conf` and rebuilds the initramfs for all kernels. (The default compression can cause boot issues with some live-boot configurations.)
-5. **Uncomments `media_opt="--force-extra-removable"`** in `/etc/refractainstaller.conf`. This makes `grub-install` create the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader, fixing the VirtualBox EFI boot failure.
+5. **Uncomments `media_opt="--force-extra-removable"`** in `/etc/refractainstaller.conf`, so `grub-install` creates the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader — fixing the VirtualBox EFI boot failure.
+</details>
 
-After this script completes, apply the btrfs patch (below) if you want btrfs support, then run the seed script (below), then run `refractasnapshot` to create the ISO.
-
-### `btrfs-support-for-refractainstaller.patch`
-
-**Patch for refractainstaller. Adds btrfs filesystem support, fixes EFI partition mounting, and adds dual logging.**
-
-A standard unified diff that patches both the GUI and CLI versions of refractainstaller (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`).
+**Preparation Step 2: Apply the patch to bring v9.6.6 to v9.6.6.10.**
 
 ```bash
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 ```
 
-The patch has evolved through ten versions:
+A standard unified diff that patches both the GUI and CLI installers.
 
-#### v1 — btrfs filesystem support
+<details>
+
+ (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, and the guided/automated disk setup. See the [Developers](#developers) section for the full version history.
+</details>
+
+Alternatively, just copy all of the files from the subdirectory `refractainstaller_patched/9.6.6.10/` to `/usr/bin/` and make them executable.
+
+#### Usage (every time you want to pack ISO)
+
+**Usage Step 1: Seed your desktop configuration into the ISO.**
+
+```bash
+bash refracta_seed_home_environment_before_iso_creation.sh
+```
+
+Run this **as your regular user (not root)**. It copies your current KDE Plasma 6 configuration, application settings, and dotfiles into `/etc/skel`, so the resulting ISO boots as a near-identical clone of your running desktop. Every new user (live or freshly installed) inherits your setup.
+
+<details>
+
+It copies into `/etc/skel`: shell dotfiles (`.bashrc`, `.zshrc`, `.profile`, …); KDE Plasma 6 core config (`kdeglobals`, `kwinrc`, `plasmarc`, shortcuts, activities, power management, …); KDE application data (`dolphin`, `konsole`, `kate`, `spectacle`, `okular`, color schemes, icons, fonts, …); all other `~/.config/` app configs (Firefox, VSCode, terminals, editors, …); `~/.local/bin/` custom binaries; GTK 3/4 integration; autostart entries.
+
+It intentionally excludes: `~/.cache/`; `~/.local/share/Trash/`, `thumbnails/`, `baloo/`, `akonadi/`; `~/.local/share/kwalletd/` (encrypted passwords — security); `~/.config/pulse/`, `dconf/` (runtime/session-specific); `*.lock`, `*.pid`, `*.socket` files. Ownership of `/etc/skel` is reset to `root:root` afterwards; the live system re-chowns to the new user automatically.
+
+</details>
+
+**Usage Step 2: Create the ISO.**
+
+```bash
+sudo refractasnapshot
+```
+
+Produces the custom bootable ISO.
+
+### On the target machine
+
+1. **Boot from the ISO.**
+2. **Run `refractainstaller-gui`.** 
+
+<details>
+It opens with a disk-state screen (inventory via `lsblk`, live-medium detection, and a destructive-action warning), then asks how you want to install:
+
+- **Automated btrfs install**: for a machine with a **blank disk**. Skips both the expert-options screen and the partitioning screen: it auto-selects the disk (one blank disk → used automatically; several disks but one blank → that one; more than one blank → you pick), asks for a single confirmation, then wipes it and builds EFI + `/boot` + btrfs-with-subvolumes + manifest and installs. Requires a UEFI boot.
+- **Custom: all options** full expert options, manual partitioning or the "Do not format" path, plus the Partitioning page's *Auto-create btrfs layout* and *Explain btrfs subvolumes* buttons.
+</details>
+
+3. **Reboot.**
+
+### Option 2: preparing a disk manually
+
+If you want to lay out the disk yourself before installing (instead of the Automated mode), you can use GParted, or, run one of these scripts, then choose **"Do not format"** in the installer:
+
+```bash
+sudo bash disk_setup_for_btrfs_desktop_subvolumes.sh   # btrfs with subvolumes (+ manifest)
+sudo bash disk_setup_for_btrfs_desktop_plain.sh        # plain btrfs root, no subvolumes
+```
+
+Both wipe the target disk and create the same GPT layout on `/dev/nvme0n1` (configurable at the top of the script):
+
+| Partition | Size | Type | FS | Mount |
+|---|---|---|---|---|
+| p1 | 1024 MiB | EF00 (EFI System) | FAT32 | `/boot/efi` |
+| p2 | 1024 MiB | 8300 (Linux) | ext4 | `/boot` |
+| p3 | ~rest | 8300 (Linux) | btrfs | `/` (plain, or subvolumes) |
+
+The **subvolumes** script creates these subvolumes on p3 and records them in a `.refracta-btrfs-layout` manifest at the btrfs top level (subvolid=5):
+
+| Subvolume | Mount point |
+|---|---|
+| `@rootfs` | `/` |
+| `@home` | `/home` |
+| `@var_log` | `/var/log` |
+| `@var_cache` | `/var/cache` |
+| `@libvirt_images` | `/var/lib/libvirt/images` |
+| `@swap` | `/swap` (NoCoW swapfile created here by the installer) |
+| `@tmp` | `/tmp` |
+| `@snapshots` | `/.snapshots` |
+
+When you then select **"Do not format"**, the installer reads the manifest and mounts every subvolume at its recorded mountpoint, writes the matching fstab, creates the NoCoW swapfile in `@swap`, and configures hibernation. To change the layout, edit the `REFRACTA_BTRFS_LAYOUT` array in `btrfs-disk-lib.sh`. The installer learns whatever you put there, with no code changes (see [Developers](#developers)).
+
+### Workflow at a glance
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  SOURCE MACHINE (the desktop you want to clone)         │
+|                                                         |
+│  ONCE:                                                  │
+│  1. sudo bash install_and_prepare_refracta_on_debian13  │
+│  2. sudo patch -p1 -d / < btrfs-support-...patch        │
+|                                                         |
+│  REPEAT WHEN MAKING ISO:                                |
+|  1. bash refracta_seed_home_environment_...sh           │
+│  2. sudo refractasnapshot   →  produces custom ISO      │
+└─────────────────────────────────────────────────────────┘
+                          │ ISO
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  TARGET MACHINE (VirtualBox or bare metal)              │
+│                                                         │
+│  1. Boot from the ISO                                   │
+│  2. Run refractainstaller-gui                           │
+│     → disk-state screen (inventory + warning)           │
+│     → "Automated btrfs install" (blank disk): picks a   │
+│       blank disk + builds everything, no more questions │
+│     → or "Custom - all options": manual / Do not format │
+│       (GParted, disk_setup_*.sh, Auto-create button)    │
+│  3. Reboot — system boots with EFI fallback bootloader  │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Developers
+
+### Repository layout
+
+| Path | What it is |
+|---|---|
+| `btrfs-support-for-refractainstaller.patch` | The patch. Applied against the **pristine** 9.6.6 scripts (not the installed copies, which can be stale). Patches `refractainstaller-yad` + `refractainstaller` and creates the shared library. |
+| `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
+| `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
+| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.10/`), including `btrfs-disk-lib.sh`. |
+| `install_and_prepare_refracta_on_debian13.sh` | Source-machine setup (see Usage). |
+| `refracta_seed_home_environment_before_iso_creation.sh` | Home-config seeding (see Usage). |
+
+**Manifest, not name inference:** a btrfs subvolume stores no mountpoint metadata, and names alone are ambiguous — `@libvirt_images` cannot be mapped to `/var/lib/libvirt/images` by any naming rule, and `@snapshots → /.snapshots`, `@swap`, and `@rootfs → /` are all special cases. The manifest (`.refracta-btrfs-layout`, TAB-separated `<subvolume><TAB><mountpoint>` lines) makes the disk-setup step the single source of truth and the installer fully layout-agnostic. Name-convention discovery is kept only as a best-effort fallback for disks that have no manifest.
+
+### Patch version history
+
+The btrfs patch evolved through ten versions. Each drawer expands to the full technical write-up.
+
+<details>
+<summary><b>v1 — btrfs filesystem support</b></summary>
 
 Adds two new options to the filesystem selection menu:
 
@@ -57,7 +209,7 @@ Adds two new options to the filesystem selection menu:
 | **btrfs (single partition)** | Formats the root partition as btrfs. Single fstab entry, no subvolumes. The top-level btrfs volume (subvolid=5) is mounted as `/`. |
 | **btrfs (with subvolumes)** | Formats as btrfs and creates five subvolumes, mounts each at its mount point before rsync, generates multi-entry fstab with `subvol=` options. |
 
-Default subvolumes created by the "with subvolumes" option (this built-in set is the **fallback** only — as of v5 the real layout is learned from the disk; see below):
+Default subvolumes created by the "with subvolumes" option (this built-in set is the **fallback** only — as of v5 the real layout is learned from the disk):
 
 | Subvolume | Mount point |
 |---|---|
@@ -75,14 +227,20 @@ Additional behaviour:
 - A runtime check for `btrfs-progs` (`mkfs.btrfs`) is performed with a user-friendly error message if missing.
 - ext2/ext3/ext4 paths are unchanged — the patch only adds new branches.
 
-#### v2 — btrfs bug fixes
+</details>
+
+<details>
+<summary><b>v2 — btrfs bug fixes</b></summary>
 
 Two bugs discovered during real installation testing:
 
 - **Subvolume creation with `no_format=yes`**: v1 tried to create subvolumes even when "Do not format" was selected and the subvolumes already existed, causing a non-fatal "File exists" error. Fixed by moving subvolume creation inside the `no_format` check — subvolumes are now only created when actually formatting.
 - **Duplicated `rootflags` in kernel command line**: v1 used `sed` to add `rootflags=subvol=@rootfs` to `GRUB_CMDLINE_LINUX_DEFAULT`, but `update-grub` (grub-mkconfig) already auto-detects btrfs subvolume roots and adds this parameter automatically. The `sed` caused the parameter to appear twice in the kernel command line. Fixed by removing the redundant `sed` — `update-grub` handles it.
 
-#### v3 — EFI boot fixes + dual logging
+</details>
+
+<details>
+<summary><b>v3 — EFI boot fixes + dual logging</b></summary>
 
 Three categories of fixes discovered when the installed system still wouldn't boot despite v2:
 
@@ -110,7 +268,10 @@ Fixes applied:
 - At the end of the install, the tail process is stopped and a final `cp` sync is performed.
 - If the install crashes or the user examines either disk, both logs contain the same information.
 
-#### v4 — findmnt fix for nested mount verification
+</details>
+
+<details>
+<summary><b>v4 — findmnt fix for nested mount verification</b></summary>
 
 Discovered during a real install test: the ESP mount verification added in v3 used `df | grep -q "/target/boot/efi"` to check if the ESP was mounted. However, `df` without arguments only shows top-level mount points — it does not list nested mounts. Since `/target/boot/efi` is mounted **under** `/target/boot` (which is under `/target`), `df` collapses it and the grep fails — even when the ESP is correctly mounted. This caused the installer to abort with "EFI partition is not mounted" despite the mount being perfectly fine.
 
@@ -118,7 +279,10 @@ Fix applied:
 
 - Replaced all `df | grep` ESP verification checks with `findmnt`, which reliably detects nested mounts. This affects three checks per script: the ESP pre-unmount check, the post-mount verification, and the `install_grub()` pre-flight check.
 
-#### v5 — learn the subvolume layout from the disk + NoCoW swapfile
+</details>
+
+<details>
+<summary><b>v5 — learn the subvolume layout from the disk + NoCoW swapfile</b></summary>
 
 Up to v4 the subvolume scheme was hard-coded in the installer (`@rootfs @home @var @tmp @snapshots`). That meant any disk created with a different layout (e.g. `disk_setup_for_btrfs_desktop_subvolumes.sh`, which uses `@var_log @var_cache @libvirt_images @swap …`) would have its extra subvolumes **silently ignored** — their contents would land inside `@rootfs` instead of on their own subvolume. v5 removes the hard-coding entirely.
 
@@ -141,7 +305,10 @@ A btrfs swapfile must be NoCoW or `swapon` fails with "swapfile has holes". The 
 - creates the swapfile with `chattr +C` on an empty file **before** writing any data, for both plain btrfs and subvolume layouts;
 - when the layout has a dedicated `@swap` subvolume, creates the swapfile **inside it** (e.g. `/swap/swapfile`), keeping it out of root snapshots, and points the fstab swap entry at the real path.
 
-#### v6 — EFI + separate `/boot` grub fix + RAM-sized swap
+</details>
+
+<details>
+<summary><b>v6 — EFI + separate <code>/boot</code> grub fix + RAM-sized swap</b></summary>
 
 Found during a real "Do not format" btrfs-subvolumes install (which otherwise verified perfectly — manifest learning, all 8 subvolumes mounted, fstab, NoCoW swapfile).
 
@@ -161,9 +328,12 @@ fi
 
 **RAM-sized swapfile:**
 
-The stock swapfile default is 256 MiB (`swapfile_count=262144`), which rounds to **0 GiB** in `free -g` and is useless on a desktop. The swapfile is now sized to **match the target machine's RAM** (rounded up to a whole GiB), auto-detected from `/proc/meminfo` at install time — large enough to be useful and to support hibernation. This applies to **every filesystem** (ext2/3/4 and btrfs), not just btrfs; it falls back to the configured size if RAM can't be read. On btrfs the swapfile is additionally made NoCoW (see above). (`chmod` now precedes `mkswap`, dropping the harmless "insecure permissions" warning.) Actually hibernating to the swapfile also needs `resume=`/`resume_offset=` kernel parameters — wired up in v7 below.
+The stock swapfile default is 256 MiB (`swapfile_count=262144`), which rounds to **0 GiB** in `free -g` and is useless on a desktop. The swapfile is now sized to **match the target machine's RAM** (rounded up to a whole GiB), auto-detected from `/proc/meminfo` at install time — large enough to be useful and to support hibernation. This applies to **every filesystem** (ext2/3/4 and btrfs), not just btrfs; it falls back to the configured size if RAM can't be read. On btrfs the swapfile is additionally made NoCoW (see above). (`chmod` now precedes `mkswap`, dropping the harmless "insecure permissions" warning.) Actually hibernating to the swapfile also needs `resume=`/`resume_offset=` kernel parameters — wired up in v7.
 
-#### v7 — hibernation (resume from swap), all scenarios
+</details>
+
+<details>
+<summary><b>v7 — hibernation (resume from swap), all scenarios</b></summary>
 
 v6 sized swap large enough for hibernation; v7 configures the system to actually resume from it. `configure_resume()` handles every swap scenario:
 
@@ -177,7 +347,10 @@ For each, it writes `RESUME=UUID=<dev>` to `/etc/initramfs-tools/conf.d/resume` 
 
 > **VirtualBox caveat:** S4/hibernation generally does **not** work under VirtualBox (its EFI/ACPI doesn't reliably trigger the kernel's resume). Everything is configured correctly, but test actual hibernate/restore on **bare metal**.
 
-#### v8 — in-tool manifest help (discoverable without this README)
+</details>
+
+<details>
+<summary><b>v8 — in-tool manifest help (discoverable without this README)</b></summary>
 
 The manifest-driven flow is now explained from inside the installer, so a user who has never seen this README can understand and use it:
 
@@ -186,7 +359,10 @@ The manifest-driven flow is now explained from inside the installer, so a user w
 
 Both share the same wording, and the recipe shown was verified to parse correctly through the installer's own manifest reader.
 
-#### v9 — guided disk setup + disk-state first screen (GUI)
+</details>
+
+<details>
+<summary><b>v9 — guided disk setup + disk-state first screen (GUI)</b></summary>
 
 So you no longer have to run a disk-prep script separately, the GUI can build the disk itself — and it now states its destructive potential up front.
 
@@ -196,7 +372,10 @@ So you no longer have to run a disk-prep script separately, the GUI can build th
 
 The CLI installer is unchanged in v9 (guided mode is GUI-only); manual partitioning and the existing "Do not format" path are untouched — guided mode is purely additive and opt-in.
 
-#### v10 — intro mode-fork: automated vs custom (GUI)
+</details>
+
+<details>
+<summary><b>v10 — intro mode-fork: automated vs custom (GUI)</b></summary>
 
 To make the guided/expert division obvious, `refractainstaller-gui` now asks, right after the greeting, **how** you want to install:
 
@@ -205,111 +384,9 @@ To make the guided/expert division obvious, `refractainstaller-gui` now asks, ri
 
 Also: **guided btrfs now refuses to combine with encryption** — if encryption (root or `/home`) is selected and you then trigger a guided btrfs setup, the installer stops with an explanation rather than building an inconsistent (non-LUKS) layout. Internally, the automated and Partitioning-page guided paths share one `_guided_set_vars()` so the variable contract lives in a single place. (CLI and `btrfs-disk-lib.sh` are unchanged in v10.)
 
-### `btrfs-disk-lib.sh`
+</details>
 
-Shared library defining `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume layout), the manifest filename, and the functions that partition a disk, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside the script). Edit the layout here and both the installer's guided mode and the standalone script follow.
-
-### `disk_setup_for_btrfs_desktop_plain.sh` / `disk_setup_for_btrfs_desktop_subvolumes.sh`
-
-**Disk partitioning scripts. Run from the Refracta live ISO on the target machine before running refractainstaller.** Pick one:
-
-- `disk_setup_for_btrfs_desktop_plain.sh` — plain btrfs root, no subvolumes.
-- `disk_setup_for_btrfs_desktop_subvolumes.sh` — btrfs with subvolumes for effective snapshots, **and writes the layout manifest** the installer learns from.
-
-Both wipe the target disk and create a GPT partition table, ready for the "Do not format" installer path.
-
-```bash
-sudo bash disk_setup_for_btrfs_desktop_subvolumes.sh   # or _plain.sh
-```
-
-Both create the same three-partition layout on `/dev/nvme0n1` (configurable at the top of the script):
-
-| Partition | Size | Type | FS | Mount |
-|---|---|---|---|---|
-| p1 | 1024 MiB | EF00 (EFI System) | FAT32 | `/boot/efi` |
-| p2 | 1024 MiB | 8300 (Linux) | ext4 | `/boot` |
-| p3 | ~253 GiB | 8300 (Linux) | btrfs | `/` (plain, or subvolumes) |
-
-The **subvolumes** script defines its layout once (a single `subvol:mountpoint` array) and creates these subvolumes on p3, then records them in the `.refracta-btrfs-layout` manifest at the btrfs top level:
-
-| Subvolume | Mount point |
-|---|---|
-| `@rootfs` | `/` |
-| `@home` | `/home` |
-| `@var_log` | `/var/log` |
-| `@var_cache` | `/var/cache` |
-| `@libvirt_images` | `/var/lib/libvirt/images` |
-| `@swap` | `/swap` (NoCoW swapfile created here by the installer) |
-| `@tmp` | `/tmp` |
-| `@snapshots` | `/.snapshots` |
-
-To change the layout, just edit the `BTRFS_LAYOUT` array at the top of the subvolumes script — the installer learns whatever you put there, with no code changes. After the script runs, launch `refractainstaller-gui` and select **"Do not format"** — the installer reads the manifest and mounts every subvolume at its recorded mountpoint, writes the matching fstab, and puts the swapfile in `@swap`.
-
-### `refracta_seed_home_environment_before_iso_creation.sh`
-
-**Seed script. Run as your regular user (not root) before taking a snapshot.**
-
-Copies your current user's full KDE Plasma 6 configuration, application settings, and dotfiles into `/etc/skel` so that the resulting ISO boots as a near-identical clone of your running desktop. When the live system (or a newly installed system) creates a new user, it will inherit all your settings.
-
-```bash
-bash refracta_seed_home_environment_before_iso_creation.sh
-```
-
-What it copies into `/etc/skel`:
-
-- Shell dotfiles (`.bashrc`, `.zshrc`, `.profile`, etc.)
-- KDE Plasma 6 core config (`kdeglobals`, `kwinrc`, `plasmarc`, shortcuts, activities, power management, etc.)
-- KDE application data (`dolphin`, `konsole`, `kate`, `spectacle`, `okular`, color schemes, icons, fonts, etc.)
-- All other `~/.config/` application configs (Firefox, VSCode, terminals, editors, etc.)
-- `~/.local/bin/` custom binaries
-- GTK 3/4 integration configs
-- Autostart entries
-
-What it intentionally excludes:
-
-- `~/.cache/` (regenerated at runtime)
-- `~/.local/share/Trash/`, `thumbnails/`, `baloo/`, `akonadi/`
-- `~/.local/share/kwalletd/` (encrypted passwords — security)
-- `~/.config/pulse/`, `dconf/` (runtime/session-specific)
-- `*.lock`, `*.pid`, `*.socket` files
-
-Ownership of `/etc/skel` is set to `root:root` after copying. The live system re-chowns to the new user automatically.
-
-## Workflow
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  SOURCE MACHINE (the desktop you want to clone)         │
-│                                                         │
-│  1. sudo bash install_and_prepare_refracta_on_debian13  │
-│  2. sudo patch -p1 -d / < btrfs-support-...patch        │
-│  3. bash refracta_seed_home_environment_...sh           │
-│  4. sudo refractasnapshot   →  produces custom ISO      │
-└─────────────────────────────────────────────────────────┘
-                          │ ISO
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  TARGET MACHINE (VirtualBox or bare metal)              │
-│                                                         │
-│  1. Boot from the ISO                                   │
-│  2. Run refractainstaller-gui                           │
-│     → disk-state screen (inventory + warning)           │
-│     → "Automated btrfs install" (blank disk): picks a   │
-│       blank disk + builds everything, no more questions │
-│     → or "Custom - all options": manual / Do not format │
-│       (GParted, disk_setup_*.sh, Auto-create button)    │
-│  3. Reboot — system boots with EFI fallback bootloader  │
-└─────────────────────────────────────────────────────────┘
-```
-
-## Requirements
-
-- Debian 13 (trixie) x64
-- KDE Plasma 6 (for the seed script to be useful)
-- Root access (for install script and patch)
-- `wget`, `patch`, `initramfs-tools` (all standard on Debian)
-
-## Refracta Versions
+### Refracta component versions
 
 | Package | Version | Source |
 |---|---|---|
@@ -323,7 +400,6 @@ Ownership of `/etc/skel` is set to `root:root` after copying. The live system re
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 The Refracta patch is submitted upstream to the Refracta maintainer (fsmithred) for potential inclusion in a future release. Refracta itself is GPL-3.
-
