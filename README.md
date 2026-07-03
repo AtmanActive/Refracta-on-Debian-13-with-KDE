@@ -1,14 +1,14 @@
 # Debian 13 to ISO and back
 ### ( Refracta-on-Debian-13-with-KDE )
 
-Scripts to make [Refracta](https://sourceforge.net/projects/refracta/) work on [Debian 13 (trixie)](https://www.debian.org/) with [KDE Plasma](https://kde.org/plasma-desktop/).
+Scripts to make [Refracta Tools](https://sourceforge.net/projects/refracta/files/tools/) work on [Debian 13 (trixie)](https://www.debian.org/) with [KDE Plasma](https://kde.org/plasma-desktop/).
 Pack a running operating system into a bootable ISO and install it on another machine.
 
 ## Purpose
 
 The goal is to allow continuous customization of a Debian 13 + KDE Plasma desktop, while hopping from one machine to the next, including the Live ISO mode.
 This enables your operating system to remain yours, no matter how often you change hardware, or even ad-hoc from the Live CD/USB.
-Refracta is the software developed to snapshot a running operating system into a live ISO and install that ISO on other machines (e.g. via VirtualBox for testing, then bare metal).
+Refracta Tools is the software developed to snapshot a running operating system into a live ISO and install that ISO on other machines.
 
 <details>
 <summary>But, for Refracta Installer, two problems had to be solved:</summary>
