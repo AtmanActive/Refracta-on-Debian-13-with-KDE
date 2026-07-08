@@ -63,46 +63,58 @@ A one-time, idempotent setup script (safe to re-run, each step checks state and 
 5. **Uncomments `media_opt="--force-extra-removable"`** in `/etc/refractainstaller.conf`, so `grub-install` creates the `\EFI\BOOT\BOOTX64.EFI` fallback bootloader — fixing the VirtualBox EFI boot failure.
 </details>
 
-**Preparation Step 2: Apply the patch to bring v9.6.6 to v9.6.6.10.**
+**Preparation Step 2: Apply the patches.**
 
 ```bash
+# btrfs support for refractainstaller (v9.6.6 → v9.6.6.10)
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
+
+# default "seed /etc/skel + UEFI" snapshot mode for refractasnapshot
+sudo patch -p1 -d / < skel-seed-for-refractasnapshot.patch
 ```
 
-A standard unified diff that patches both the GUI and CLI installers.
+Two standard unified diffs.
 
 <details>
 
- (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, and the guided/automated disk setup. See the [Developers](#developers) section for the full version history.
+**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, and the guided/automated disk setup.
+
+**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below).
+
+See the [Developers](#developers) section for the full version history.
 </details>
 
-Alternatively, just copy all of the files from the subdirectory `refractainstaller_patched/9.6.6.10/` to `/usr/bin/` and make them executable.
+Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.10/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
 
-#### Usage (every time you want to pack ISO)
+#### Usage (every time you want to pack an ISO)
 
-**Usage Step 1: Seed your desktop configuration into the ISO.**
+**Just run refractasnapshot and take the default mode.**
+
+```bash
+sudo refractasnapshot        # CLI: press ENTER to accept the default mode
+sudo refractasnapshot-gui    # GUI: the first task is pre-selected — click OK
+```
+
+The **default mode — "Snapshot now: UEFI + seed /etc/skel from your desktop"** — does everything in one/two clicks: it seeds `/etc/skel` from your desktop user's home (so the ISO boots as a near-identical clone of your running desktop, and every new live/installed user inherits your setup), forces a UEFI-bootable image, and skips the free-space report and distro-name prompts. The classic **"Create a snapshot"** task is still there (item `1`) for the full interactive flow without seeding.
+
+<details>
+<summary><b>What gets seeded into /etc/skel (and how to seed it separately)</b></summary>
+
+Seeded: shell dotfiles (`.bashrc`, `.zshrc`, `.profile`, …); KDE Plasma 6 core config (`kdeglobals`, `kwinrc`, `plasmarc`, shortcuts, activities, power management, …); KDE application data (`dolphin`, `konsole`, `kate`, `spectacle`, `okular`, color schemes, icons, fonts, …); all other `~/.config/` app configs (Firefox, VSCode, terminals, editors, …); `~/.local/bin/` custom binaries; GTK 3/4 integration; autostart entries.
+
+Excluded: `~/.cache/`; `~/.local/share/Trash/`, `thumbnails/`, `baloo/`, `akonadi/`; `~/.local/share/kwalletd/` (encrypted passwords — security); `~/.config/pulse/`, `dconf/` (runtime/session-specific); `*.lock`, `*.pid`, `*.socket`. Ownership of `/etc/skel` is reset to `root:root` afterwards; the live system re-chowns to the new user automatically.
+
+To seed `/etc/skel` **separately** — e.g. to review it before snapshotting — run this **as your regular user (not root)**:
 
 ```bash
 bash refracta_seed_home_environment_before_iso_creation.sh
 ```
 
-Run this **as your regular user (not root)**. It copies your current KDE Plasma 6 configuration, application settings, and dotfiles into `/etc/skel`, so the resulting ISO boots as a near-identical clone of your running desktop. Every new user (live or freshly installed) inherits your setup.
-
-<details>
-
-It copies into `/etc/skel`: shell dotfiles (`.bashrc`, `.zshrc`, `.profile`, …); KDE Plasma 6 core config (`kdeglobals`, `kwinrc`, `plasmarc`, shortcuts, activities, power management, …); KDE application data (`dolphin`, `konsole`, `kate`, `spectacle`, `okular`, color schemes, icons, fonts, …); all other `~/.config/` app configs (Firefox, VSCode, terminals, editors, …); `~/.local/bin/` custom binaries; GTK 3/4 integration; autostart entries.
-
-It intentionally excludes: `~/.cache/`; `~/.local/share/Trash/`, `thumbnails/`, `baloo/`, `akonadi/`; `~/.local/share/kwalletd/` (encrypted passwords — security); `~/.config/pulse/`, `dconf/` (runtime/session-specific); `*.lock`, `*.pid`, `*.socket` files. Ownership of `/etc/skel` is reset to `root:root` afterwards; the live system re-chowns to the new user automatically.
+The standalone script and the snapshot's built-in mode share the same library (`skel-seed-lib.sh`), so they seed identically. Edit the arrays there to change what gets seeded.
 
 </details>
 
-**Usage Step 2: Create the ISO.**
-
-```bash
-sudo refractasnapshot
-```
-
-Produces the custom bootable ISO.
+Produces the custom bootable ISO in `$snapshot_dir` (default `/home/snapshot`).
 
 ### On the target machine
 
@@ -159,10 +171,11 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 │  ONCE:                                                  │
 │  1. sudo bash install_and_prepare_refracta_on_debian13  │
 │  2. sudo patch -p1 -d / < btrfs-support-...patch        │
-|                                                         |
-│  REPEAT WHEN MAKING ISO:                                |
-|  1. bash refracta_seed_home_environment_...sh           │
-│  2. sudo refractasnapshot   →  produces custom ISO      │
+│  3. sudo patch -p1 -d / < skel-seed-...patch            │
+│                                                         │
+│  REPEAT WHEN MAKING ISO:                                │
+│  • sudo refractasnapshot  → default "seed /etc/skel +   │
+│    UEFI" mode → custom ISO in one/two clicks            │
 └─────────────────────────────────────────────────────────┘
                           │ ISO
                           ▼
@@ -190,10 +203,21 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 | `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
 | `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
 | `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.10/`), including `btrfs-disk-lib.sh`. |
+| `skel-seed-for-refractasnapshot.patch` | The patch that folds `/etc/skel` seeding into refractasnapshot. Applied against the **pristine** 10.4.3/10.4.1 scripts. Patches `refractasnapshot` + `refractasnapshot-gui` and creates the shared library. |
+| `skel-seed-lib.sh` | **Single source of truth** for `/etc/skel` seeding. Defines the dotfile / config / app-data arrays and the copy logic. The patch installs it to `/usr/lib/refractasnapshot/skel-seed-lib.sh`; the standalone seed script sources it (falling back to a copy beside itself). Edit the arrays here and the snapshot tools + the standalone script all follow. |
+| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.1/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`. |
 | `install_and_prepare_refracta_on_debian13.sh` | Source-machine setup (see Usage). |
-| `refracta_seed_home_environment_before_iso_creation.sh` | Home-config seeding (see Usage). |
+| `refracta_seed_home_environment_before_iso_creation.sh` | Standalone `/etc/skel` seeder — now a thin CLI wrapper around `skel-seed-lib.sh` (the snapshot tools' default mode does the same thing). |
 
 **Manifest, not name inference:** a btrfs subvolume stores no mountpoint metadata, and names alone are ambiguous — `@libvirt_images` cannot be mapped to `/var/lib/libvirt/images` by any naming rule, and `@snapshots → /.snapshots`, `@swap`, and `@rootfs → /` are all special cases. The manifest (`.refracta-btrfs-layout`, TAB-separated `<subvolume><TAB><mountpoint>` lines) makes the disk-setup step the single source of truth and the installer fully layout-agnostic. Name-convention discovery is kept only as a best-effort fallback for disks that have no manifest.
+
+### refractasnapshot: the "seed /etc/skel + UEFI" default mode
+
+`skel-seed-for-refractasnapshot.patch` folds the standalone seed step into both snapshot tools, mirroring how `btrfs-disk-lib.sh` was folded into refractainstaller.
+
+- **`skel-seed-lib.sh`** (installed to `/usr/lib/refractasnapshot/`) is the single source of truth for *what* gets seeded (dotfiles + KDE/Plasma config + `~/.local/share` app data + a bulk `~/.config` sync with exclusions) and the copy logic. Sourcing it only defines functions; `refracta_seed_skel <home>` does the work and never calls `exit`. Both the snapshot tools and the standalone `refracta_seed_home_environment_before_iso_creation.sh` source it — edit the arrays once and all three follow.
+- **Privilege bridge:** writing `/etc/skel` needs root, but reading the config needs the desktop user. `refractasnapshot` already runs as root, so `_skel_as_root` runs commands directly and `refracta_skel_source_home` resolves the desktop user's home even under root (`SUDO_USER` → `PKEXEC_UID` → the uid-1000 user). The standalone script runs as the user and elevates writes with `sudo`. Either way the final `chown -R root:root /etc/skel` fixes ownership; the live system re-chowns per new user.
+- **New default task** (CLI item `0` / pre-selected first GUI row): forces `make_efi=yes` (re-running `check_grub`, which only ever *downgrades*, so it still degrades safely to a BIOS ISO if grub-efi/dosfstools are missing), seeds `/etc/skel` **before** the filesystem is copied (so it lands in the ISO), and runs a "fast" path that skips the free-space report and distro-name prompt — hence one/two clicks. The task-1 body is factored into `run_create_snapshot[_gui]()` so the default and classic modes share one code path via the `seed_skel` / `fast_mode` flags. Tasks 2–6 are untouched.
 
 ### Patch version history
 
