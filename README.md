@@ -86,19 +86,14 @@ See the [Developers](#developers) section for the full version history.
 
 Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.10/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
 
-#### Usage (every time you want to pack an ISO)
+## Usage (every time you want to pack an ISO)
 
 **Just run refractasnapshot and take the default mode.**
 
-```bash
-sudo refractasnapshot        # CLI: press ENTER to accept the default mode
-sudo refractasnapshot-gui    # GUI: the first task is pre-selected — click OK
-```
-
-The **default mode — "Snapshot now: UEFI + seed /etc/skel from your desktop"** — does everything in one/two clicks: it seeds `/etc/skel` from your desktop user's home (so the ISO boots as a near-identical clone of your running desktop, and every new live/installed user inherits your setup), forces a UEFI-bootable image, and skips the free-space report and distro-name prompts. The classic **"Create a snapshot"** task is still there (item `1`) for the full interactive flow without seeding.
-
 <details>
 <summary><b>What gets seeded into /etc/skel (and how to seed it separately)</b></summary>
+
+The **default mode — "Snapshot now: UEFI + seed /etc/skel from your desktop"** — does everything in one/two clicks: it seeds `/etc/skel` from your desktop user's home (so the ISO boots as a near-identical clone of your running desktop, and every new live/installed user inherits your setup), forces a UEFI-bootable image, and skips the free-space report and distro-name prompts. The classic **"Create a snapshot"** task is still there (item `1`) for the full interactive flow without seeding.
 
 Seeded: shell dotfiles (`.bashrc`, `.zshrc`, `.profile`, …); KDE Plasma 6 core config (`kdeglobals`, `kwinrc`, `plasmarc`, shortcuts, activities, power management, …); KDE application data (`dolphin`, `konsole`, `kate`, `spectacle`, `okular`, color schemes, icons, fonts, …); all other `~/.config/` app configs (Firefox, VSCode, terminals, editors, …); `~/.local/bin/` custom binaries; GTK 3/4 integration; autostart entries.
 
@@ -116,6 +111,8 @@ The standalone script and the snapshot's built-in mode share the same library (`
 
 Produces the custom bootable ISO in `$snapshot_dir` (default `/home/snapshot`).
 
+<hr>
+
 ### On the target machine
 
 1. **Boot from the ISO.**
@@ -130,7 +127,9 @@ It opens with a disk-state screen (inventory via `lsblk`, live-medium detection,
 
 3. **Reboot.**
 
-### Option 2: preparing a disk manually
+### Option 2: preparing the disk manually
+
+<details>
 
 If you want to lay out the disk yourself before installing (instead of the Automated mode), you can use GParted, or, run one of these scripts, then choose **"Do not format"** in the installer:
 
@@ -162,6 +161,10 @@ The **subvolumes** script creates these subvolumes on p3 and records them in a `
 
 When you then select **"Do not format"**, the installer reads the manifest and mounts every subvolume at its recorded mountpoint, writes the matching fstab, creates the NoCoW swapfile in `@swap`, and configures hibernation. To change the layout, edit the `REFRACTA_BTRFS_LAYOUT` array in `btrfs-disk-lib.sh`. The installer learns whatever you put there, with no code changes (see [Developers](#developers)).
 
+</details>
+
+<hr>
+
 ### Workflow at a glance
 
 ```
@@ -192,6 +195,8 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 │  3. Reboot — system boots with EFI fallback bootloader  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+<hr>
 
 ## Developers
 
@@ -410,7 +415,42 @@ Also: **guided btrfs now refuses to combine with encryption** — if encryption 
 
 </details>
 
-### Refracta component versions
+<hr>
+
+## Tips & Tricks
+
+**Q: My KDE Dolphin forgot my chosen View Mode (e.g. Compact reverted to Icons on a freshly-cloned machine or a new user).**
+
+<details>
+<summary><b>A: Manually create .directory file</b></summary>
+With its default *Global View Properties* setting, Dolphin does **not** store the view mode in any config file — it keeps it in the **Plasma session** (restored at login by `ksmserver`), held only in memory while Dolphin runs. Because session data is machine-/session-specific, it is not carried into `/etc/skel` (and *should not* be), so a new user or a freshly-installed clone falls back to Dolphin's compiled-in default (Icons). Even quitting Dolphin does not write the setting to disk.
+
+To make the view mode **persistent on disk** (so it survives to new users and clones), close all Dolphin windows and create the file:
+
+```
+~/.local/share/dolphin/view_properties/global/.directory
+```
+
+with these contents:
+
+```ini
+[Dolphin]
+Timestamp=2026,7,8,13,0,0
+Version=4
+ViewMode=2
+```
+
+- **`ViewMode`** on Dolphin 25.04.x is `0` = Icons, `1` = Details, **`2` = Compact**. (Note: this ordering is *not* the intuitive one — Compact is `2`, not `1`.)
+- **`Timestamp`** must be **newer** than the `ViewPropsTimestamp` line in `~/.config/dolphinrc`, or Dolphin treats the file as stale and ignores it. Use roughly the current date/time in `YEAR,M,D,H,M,S` format.
+- This relies on Dolphin's *Global View Properties* being enabled (the default — i.e. no `GlobalViewProps=false` in `dolphinrc`).
+
+Once this file exists, `refractasnapshot`'s `/etc/skel` seeding copies it like any other config, so every new user on the resulting ISO opens Dolphin in your chosen view.
+
+</details>
+
+<hr>
+
+### Refracta component versions these patches are based on
 
 | Package | Version | Source |
 |---|---|---|
@@ -421,6 +461,8 @@ Also: **guided btrfs now refuses to combine with encryption** — if encryption 
 | refracta2usb | 2.4.3 | SourceForge |
 
 > **Note:** The snapshot base (10.4.3) and gui (10.4.1) version numbers differ intentionally. Per the maintainer's note: *"Use latest available version of -gui with latest version of -base, even if numbers are different."*
+
+<hr>
 
 ## License
 
