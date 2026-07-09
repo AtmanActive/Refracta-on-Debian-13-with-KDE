@@ -1,63 +1,58 @@
 From: Refracta user
-Date: 2026-06-30
-Subject: [PATCH v10] intro mode-fork: automated blank-disk vs custom (GUI)
+Date: 2026-07-09
+Subject: [PATCH v12] GUI installer: automated mode asks everything up front, then runs unattended
 
-Building on v1-v9, v10 makes the guided/expert division explicit in the GUI and
-adds a fully automated blank-disk path, plus a guided-vs-encryption safeguard.
+Building on v1-v11. v11 instrumented the GUI installer so the log shows exactly
+WHEN each dialog appeared; the log of a real automated run confirmed the UX
+problem: after the up-front option/disk dialogs the installer does a long copy
+(~3.5 min of rsync) and only THEN asks the bootloader question, the hostname/
+username, and the password(s). The user cannot walk away - they return to more
+prompts and more waiting.
 
-Installation-type dialog (right after the greeting):
+v12 fixes this for the "Automated btrfs install" path (auto_mode) only. Custom
+mode is unchanged.
 
-  refractainstaller-gui now asks, up front:
-    - "Automated btrfs install" - for a machine with a BLANK disk. Wipes one
-      blank disk, builds the EFI + /boot + btrfs-subvolume layout automatically,
-      and installs, skipping BOTH the expert-options screen and the partitioning
-      screen. Requires a UEFI boot; refuses if there is no blank disk.
-    - "Custom - all options" - the installer behaves exactly as before (manual
-      partitioning / "Do not format", full expert options, the Partitioning
-      page with its "Auto-create btrfs layout" and "Explain btrfs subvolumes"
-      buttons).
+What changes (auto_mode only):
 
-Automated disk selection (guided_auto_setup):
+  - The hostname/username dialog and the password dialog(s) are now asked BEFORE
+    the copy, in a single collect phase placed just before the Summary, so the
+    Summary is the true final "last chance" gate. Their answers are remembered
+    in variables (new_hostname/newname/.../user_newpass/root_newpass) and applied
+    unattended in the install tail.
+  - The post-copy "Install Bootloader" dialog is skipped: automated mode already
+    promises no expert questions, so GRUB is always installed (answer=3).
+  - The tail's dialog calls are guarded so auto_mode never re-prompts: the
+    username dialog, the hostname-legality check, and set_rootpass/set_userpass
+    use the pre-collected values instead of showing a dialog.
 
-  - exactly one blank disk        -> used automatically;
-  - several disks, one blank      -> that blank disk used automatically;
-  - more than one blank disk      -> the user picks from the blank disks.
-  A blank disk = no partitions, no partition table, no filesystem signature; the
-  live boot medium and mounted disks are always excluded. One confirmation, then
-  the shared btrfs-disk-lib.sh partitions the disk and the guided variables are
-  set so the rest of the install runs non-interactively (learns the manifest).
-  In automated mode the "create an EFI partition" notice is also suppressed
-  (the setup creates the ESP itself).
+How it is done (mechanics):
 
-Guided-vs-encryption safeguard:
+  - The dialog/collection helpers (clean_log, pass_error, configure_pass,
+    username_dialog, fix_hostname, test_hostname) are relocated verbatim to just
+    before the Summary. Bash needs a function defined before it is called, and
+    these were previously defined only in the tail (after the copy); moving them
+    up lets the collect phase call them. Custom mode calls them from the same
+    tail sites as before - behaviour is identical, only the definition point
+    moved.
+  - Passwords: the collect phase pauses xtrace (set +x) around the password
+    dialogs so the plain text never reaches the log at all, and remembers each
+    password in memory for the tail to apply (where the existing clean_log still
+    scrubs the apply-time traces). It deliberately does NOT run clean_log up
+    front: clean_log scrubs with `sed -i`, which swaps the log file's inode and
+    would detach the script's redirected stderr, silencing the rest of the
+    install. As a safety net the collect phase re-attaches stderr
+    (exec 2>>"$error_log") after the dialogs in case a mismatched-password retry
+    ran pass_error->clean_log.
 
-  If encryption (root or /home) was selected and the user then triggers a guided
-  btrfs setup, the installer now REFUSES with an explanation instead of building
-  an inconsistent layout (btrfs subvolumes/swap/hibernation are not set up on
-  LUKS). Uncheck encryption for guided btrfs, or partition manually for ext+LUKS.
-
-Refactor:
-
-  guided_btrfs_setup (v9, Partitioning-page button) and the new guided_auto_setup
-  share _guided_set_vars() so the pre-set variable contract lives in one place.
-
-Changes from v9:
-  - refractainstaller-yad: installation-type dialog (auto_mode); guided_auto_setup
-    with blank-disk auto-selection; expert-options + partitioning screens skipped
-    in automated mode; EFI-partition notice suppressed in automated mode;
-    encryption-conflict refusal in guided setup; shared _guided_set_vars().
-  - (refractainstaller CLI and btrfs-disk-lib.sh unchanged from v9.)
-
-Files patched/added:
-  usr/bin/refractainstaller-yad                    (GUI, 9.6.6)
-  usr/bin/refractainstaller                        (CLI, 9.6.6; unchanged vs v8)
-  usr/lib/refractainstaller/btrfs-disk-lib.sh      (shared library; unchanged vs v9)
-
-Apply with:
-  patch -p1 < btrfs-support-for-refractainstaller.patch
+Changes from v11:
+  - refractainstaller-yad: relocate the six dialog/collection helpers above the
+    Summary; add an auto_mode collect phase (username + password[s]); skip the
+    bootloader dialog in auto_mode (always install GRUB); guard the tail
+    username/hostname/password sites so auto_mode applies the collected answers
+    without re-prompting. Custom mode unchanged.
+  - (refractainstaller CLI and btrfs-disk-lib.sh unchanged from v9/v10/v11.)
 
 ---
-
 --- a/usr/bin/refractainstaller-yad
 +++ b/usr/bin/refractainstaller-yad
 @@ -52,6 +52,86 @@
@@ -147,7 +142,82 @@ Apply with:
  if [[ -f $configfile ]]; then
      source $configfile
  else
-@@ -156,6 +236,42 @@
+@@ -114,6 +194,13 @@
+ # (setting it in wrapper script no longer works.)
+ 	set -x
+ 
++# ── Timestamped logging (ISO-8601) ───────────────────────────────────────────
++# Every xtrace line (the bulk of this log) is prefixed with an ISO-8601 timestamp
++# via PS4, so the log shows WHEN each step ran. _iso_now uses bash's builtin
++# printf time format, so it adds no external process per traced line.
++_iso_now () { printf '%(%Y-%m-%dT%H:%M:%S%z)T' -1 ; }
++PS4='+ $(_iso_now) '
++
+ # Check that xserver is running and user is root.
+ [[ $DISPLAY ]] || { echo $"There is no xserver running. Exiting..." ; exit 1 ; }
+ if [[ $(id -u) -ne 0 ]] ; then
+@@ -130,6 +217,60 @@
+ # Record errors in a logfile.
+ exec 2>"$error_log"
+ echo "Version:	$version" >> "$error_log"
++
++# ── Dialog logging ───────────────────────────────────────────────────────────
++# Make it possible to see, from the log alone, exactly WHEN each user-facing
++# dialog was shown, what it was, how the user answered, and how long it stayed
++# open — the raw material for later decoupling the questions from the work.
++#   * log_event  appends one ISO-timestamped, greppable line to $error_log
++#                (grep 'DIALOG' for the decision/wait timeline). xtrace is paused
++#                around the bookkeeping so the markers stay clean.
++#   * yad()      is the single choke point every dialog passes through (nothing
++#                calls yad by full path). It logs an "open" marker before the
++#                dialog and a "close" marker after it — with the button exit code
++#                and how long it was open — WITHOUT disturbing yad's stdout
++#                (callers capture it) or its exit status (callers test $?).
++log_event () {
++	local _was=$-
++	{ set +x ; } 2>/dev/null
++	printf '%s %s\n' "$(_iso_now)" "$*" >> "$error_log"
++	[[ $_was == *x* ]] && set -x
++	return 0
++}
++
++yad () {
++	local _was=$-
++	{ set +x ; } 2>/dev/null
++	local _title="" _kind="dialog" _prev="" _a
++	for _a in "$@" ; do
++		[[ $_prev == "--title" ]] && _title="$_a"
++		case "$_a" in
++			--title=*)   _title="${_a#--title=}" ;;
++			--text-info) _kind="text-info" ;;
++			--list)      _kind="list" ;;
++			--form)      _kind="form" ;;
++			--entry)     _kind="entry" ;;
++			--progress)  _kind="progress" ;;
++			--question)  _kind="question" ;;
++			--info)      _kind="info" ;;
++			--file)      _kind="file" ;;
++		esac
++		_prev="$_a"
++	done
++	[[ -z "$_title" ]] && _title="(untitled)"
++	local _t0=$EPOCHSECONDS
++	printf '%s DIALOG open  kind=%-9s title=%s\n' "$(_iso_now)" "$_kind" "$_title" >> "$error_log"
++	[[ $_was == *x* ]] && set -x
++	command yad "$@"
++	local _rc=$?
++	{ set +x ; } 2>/dev/null
++	printf '%s DIALOG close kind=%-9s title=%s exit=%s duration=%ss\n' \
++		"$(_iso_now)" "$_kind" "$_title" "$_rc" "$(( EPOCHSECONDS - _t0 ))" >> "$error_log"
++	[[ $_was == *x* ]] && set -x
++	return $_rc
++}
++
++log_event "==== refractainstaller-yad (GUI) session start — $version ===="
+ #******************************************************************
+ 
+ # Make sure yad is installed, and check the version. *** What version is really needed??? ***
+@@ -156,6 +297,42 @@
  fi
  
  
@@ -190,7 +260,7 @@ Apply with:
  # Greeting window
  yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
  	--button=$"Continue":0 --button=$"Exit":1 \
-@@ -179,6 +295,134 @@
+@@ -179,6 +356,134 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -325,7 +395,7 @@ Apply with:
  # function to exit the script if there are errors
  check_exit () {
  exit_code="$?"
-@@ -331,6 +575,9 @@
+@@ -331,6 +636,9 @@
  "
  	fi
  
@@ -335,7 +405,7 @@ Apply with:
  	yad --title=$"$window_title" --width=480 --button=$"Help":0 \
  	--button=$"Continue":1 --button=$"Exit":2 --center --borders=10 \
  	--text=$"
-@@ -341,11 +588,12 @@
+@@ -341,11 +649,12 @@
  DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
  	"
  	answer="$?"
@@ -349,7 +419,7 @@ Apply with:
  else
  	# not uefi, do bios install.
  	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
-@@ -430,6 +678,9 @@
+@@ -430,6 +739,9 @@
  fi
  
  
@@ -359,7 +429,7 @@ Apply with:
  # Select installation options
  
  opts=$(yad --list --title=$"Installation Options" --center --borders=10 \
-@@ -557,10 +808,73 @@
+@@ -557,10 +869,73 @@
          fi
      fi
      # end test for cryptsetup
@@ -367,11 +437,11 @@ Apply with:
 +fi
 +
 +fi   # end: expert installation-options screen (skipped in automated mode)
++
  
++## Partition a disk #####
  
 -## Partition a disk ##### 
-+## Partition a disk #####
-+
 +
 +# Explain the manifest-driven btrfs subvolume install flow and show an example.
 +show_btrfs_manifest () {
@@ -435,7 +505,7 @@ Apply with:
  
  
  list_disks () {
-@@ -571,6 +885,99 @@
+@@ -571,6 +946,99 @@
  	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
  }
  
@@ -535,7 +605,7 @@ Apply with:
  partition_disk () {
  if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
  	cli_partition_tool="gdisk"
-@@ -578,20 +985,31 @@
+@@ -578,20 +1046,31 @@
  	cli_partition_tool="cfdisk"
  fi
  
@@ -572,7 +642,7 @@ Apply with:
  
  }
  
-@@ -611,8 +1029,16 @@
+@@ -611,8 +1090,16 @@
  fi
  
  
@@ -591,7 +661,7 @@ Apply with:
  
  ask_format_efi () {
  
-@@ -778,7 +1204,7 @@
+@@ -778,7 +1265,7 @@
  boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
  }
  
@@ -600,7 +670,7 @@ Apply with:
      choose_boot
  fi
  
-@@ -845,16 +1271,20 @@
+@@ -845,16 +1332,20 @@
  fi
  }
  
@@ -624,7 +694,7 @@ Apply with:
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +1297,48 @@
+@@ -867,10 +1358,48 @@
  fi  
  }
  
@@ -674,7 +744,155 @@ Apply with:
  fi
  
  
-@@ -1251,9 +1719,49 @@
+@@ -977,6 +1506,147 @@
+ 
+ 
+ 
++
++# ==== v12: automated mode collects ALL user input up front ====
++# The password/username/hostname dialogs and their helpers are defined here so
++# the auto_mode collect phase at the end of this block can run them BEFORE the
++# long copy, letting the rest of the install proceed unattended. In custom mode
++# these are called later in the tail, exactly as before.
++
++clean_log() {
++	
++	# clear the log of plain-text passwords
++	if [ -n "$newpass" ]; then
++		sed -i "s|$newpass|\*\*\*\*|"g $error_log
++		[[ -n "$_target_error_log" && -f "$_target_error_log" ]] && sed -i "s|$newpass|\*\*\*\*|"g "$_target_error_log"
++	fi
++	
++	if [ -n "$confirm_newpass" ]; then
++		sed -i "s|$confirm_newpass|\*\*\*\*|"g $error_log
++		[[ -n "$_target_error_log" && -f "$_target_error_log" ]] && sed -i "s|$confirm_newpass|\*\*\*\*|"g "$_target_error_log"
++	fi
++	newpass=""
++	confirm_newpass=""
++}
++
++pass_error() {
++	
++	clean_log
++	use_existing=""
++	disable_root=""
++
++	yad --title=$"Configure $pass_dialog password" --center --borders=10 --image="gtk-dialog-error" --width=320 --button=$"OK":0 \
++	--text=$"  Passwords do not match (or checkbox error)  \n\n  Please try again  "
++}
++
++configure_pass() {
++
++	clean_log
++	
++	pass_entry=$(yad --form --title=$"Configure $pass_dialog password" --center --borders=10 --button=$"OK":0 \
++	--text=$"You should reset the $pass_dialog password.\nUse TAB to change fields." \
++	--field=$"Enter new $pass_dialog password::H" \
++	--field=$"Confirm new $pass_dialog password::H"  \
++	--field=$"Use current password\? (not recommended)":CHK)
++	
++	# TODO check for illegal characters?
++	
++	newpass=$(echo $pass_entry|awk -F "|" '{print $1}')
++	confirm_newpass=$(echo $pass_entry|awk -F "|" '{print $2}')
++	use_existing=$(echo $pass_entry|awk -F "|" '{print $3}')
++	disable_root=$(echo $pass_entry|awk -F "|" '{print $4}')
++
++	if [ "$use_existing" = "TRUE" ] && [ "$disable_root" = "TRUE" ] ; then
++	pass_error
++	configure_pass
++	fi
++
++	if [ -n "$newpass" ] && [ "$use_existing" = "TRUE" ]; then
++	pass_error
++	configure_pass
++	fi
++
++	if [ "$use_existing" = "TRUE" ] || [ "$disable_root" = "TRUE" ] ; then
++	return
++	fi
++
++	if [ -z "$newpass" ] || [ "$newpass" != "$confirm_newpass" ]; then
++	pass_error
++	configure_pass
++	fi
++}
++
++username_dialog() {
++
++	newuser=$(yad --form --title=$"Configure hostname and username..." --center --borders=10 --button=$"OK":0 \
++	--text=$"\n You should change the hostname and username \n \
++	(optional but recommended) \n" \
++	--field=$"New hostname \(no spaces\):" \
++	--field=$"New username \(no spaces\):" \
++	--field=$"New user's 'real name' \(e.g. John Smith\):" \
++	--field=$"Permit sudo for new user\? (and keep root account)":CHK \
++	--field=$"Use sudo as default for new user\? (and disable root account)":CHK \
++	--field=$"Use sudo only for shutdown\? (and keep root account)":CHK \
++	"$HOSTNAME" "$oldname" "$old_realname" FALSE FALSE FALSE)
++
++	new_hostname=$(echo $newuser |awk -F "|" '{print $1}')
++	newname=$(echo $newuser |awk -F "|" '{print $2}')
++	new_realname=$(echo $newuser |awk -F "|" '{print $3}')
++	sudoconfig=$(echo $newuser |awk -F "|" '{print $4}')
++	sudo_is_default=$(echo $newuser |awk -F "|" '{print $5}')
++	sudo_shutdown=$(echo $newuser |awk -F "|" '{print $6}')
++}
++
++fix_hostname () {
++	new_hostname=$(yad --entry --title=$"Change hostname" --center --borders=10 \
++	--text=$"Illegal hostname. Try again.
++	
++You can use alphanumeric characters anywhere in the hostname, and 
++you can use the minus sign (-) as long as it's not at the beginning or end." \
++	--entry-text=$"$HOSTNAME" --width=500 --button=$"OK":0)
++	test_hostname	
++}
++
++test_hostname () {
++  if [[ -z $new_hostname ]]; then
++    new_hostname="$HOSTNAME"
++  fi
++	if [[ ! "$new_hostname" =~ (^[a-zA-Z0-9]([a-zA-Z0-9]|-)+[a-zA-Z0-9]$) ]]; then
++		fix_hostname
++	fi
++  hostname_len=${#new_hostname}
++  if [[ $hostname_len -gt 63 ]]; then
++    fix_hostname
++  fi
++}
++
++# --- auto_mode: ask hostname/username + password(s) now, remember the answers ---
++if [[ $auto_mode = "yes" ]]; then
++	# Defaults come from the SOURCE live system: it is cloned verbatim, so the
++	# installed /target will carry the same 1000:1000 user.
++	oldname=$(awk -F: '/1000:1000/ { print $1 }' /etc/passwd)
++	old_realname=$(grep "^$oldname" /etc/passwd | sed "s/,,,//" | awk -F ":" '{print $5}')
++
++	username_dialog
++	test_hostname
++
++	# Passwords: pause xtrace so the plain text never reaches the log at all,
++	# then keep each one in memory for the tail to apply. No clean_log scrub is
++	# needed here (nothing was logged); and clean_log's sed -i would swap the
++	# log inode and detach our stderr, silencing the rest of the install.
++	_pw_xtrace=$-
++	{ set +x ; } 2>/dev/null
++	pass_dialog=user ; configure_pass ; user_newpass="$newpass"
++	if [[ $sudo_is_default != "TRUE" ]]; then
++		pass_dialog=root ; configure_pass ; root_newpass="$newpass"
++	fi
++	newpass="" ; confirm_newpass=""
++	# A mismatched-password retry can call pass_error->clean_log (sed -i), which
++	# swaps the log inode; re-attach stderr so the tail stays logged.
++	exec 2>>"$error_log"
++	[[ $_pw_xtrace == *x* ]] && set -x
++fi
++
+ # Show a summary of what will be done
+ 
+ if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
+@@ -1251,9 +1921,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -726,7 +944,7 @@ Apply with:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +1841,70 @@
+@@ -1333,14 +2043,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -800,7 +1018,7 @@ Apply with:
  fi
  
  
-@@ -1531,9 +2095,23 @@
+@@ -1531,9 +2297,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -825,7 +1043,7 @@ Apply with:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2172,12 @@
+@@ -1594,10 +2374,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -839,7 +1057,7 @@ Apply with:
  fi
  
  
-@@ -1674,13 +2254,28 @@
+@@ -1674,13 +2456,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -871,7 +1089,7 @@ Apply with:
  fi
  
  
-@@ -1690,13 +2285,57 @@
+@@ -1690,13 +2487,57 @@
  
  
   
@@ -932,7 +1150,26 @@ Apply with:
  fi
  
  
-@@ -1836,7 +2475,8 @@
+@@ -1793,6 +2634,10 @@
+ fi
+ 
+ # Pause to allow manual changes to /target for UEFI boot.
++# Automated mode always installs GRUB with no prompt; answer=3 = "Install bootloader" (v12).
++if [[ $auto_mode = "yes" ]]; then
++	answer=3
++else
+ df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
+ 	--text=$"${bios_boot_warning}
+ ${grub_message}
+@@ -1808,6 +2653,7 @@
+ " \
+ "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
+ answer="$?"
++fi
+ 
+ if [[ $answer = 1 ]] ; then
+ 	chroot_terminal
+@@ -1836,7 +2682,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -942,20 +1179,169 @@ Apply with:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -2058,10 +2698,12 @@
- 	# clear the log of plain-text passwords
+@@ -1874,60 +2721,17 @@
+ oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
+ old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
+ 
+-username_dialog() {
+-
+-	newuser=$(yad --form --title=$"Configure hostname and username..." --center --borders=10 --button=$"OK":0 \
+-	--text=$"\n You should change the hostname and username \n \
+-	(optional but recommended) \n" \
+-	--field=$"New hostname \(no spaces\):" \
+-	--field=$"New username \(no spaces\):" \
+-	--field=$"New user's 'real name' \(e.g. John Smith\):" \
+-	--field=$"Permit sudo for new user\? (and keep root account)":CHK \
+-	--field=$"Use sudo as default for new user\? (and disable root account)":CHK \
+-	--field=$"Use sudo only for shutdown\? (and keep root account)":CHK \
+-	"$HOSTNAME" "$oldname" "$old_realname" FALSE FALSE FALSE)
+-
+-	new_hostname=$(echo $newuser |awk -F "|" '{print $1}')
+-	newname=$(echo $newuser |awk -F "|" '{print $2}')
+-	new_realname=$(echo $newuser |awk -F "|" '{print $3}')
+-	sudoconfig=$(echo $newuser |awk -F "|" '{print $4}')
+-	sudo_is_default=$(echo $newuser |awk -F "|" '{print $5}')
+-	sudo_shutdown=$(echo $newuser |awk -F "|" '{print $6}')
+-}
+-
+-username_dialog
++[[ $auto_mode = "yes" ]] || username_dialog
+ 
+ 
+ 
+-# Test to make sure new_hostname is a legal hostname, let user fix it if it's not.
+-fix_hostname () {
+-	new_hostname=$(yad --entry --title=$"Change hostname" --center --borders=10 \
+-	--text=$"Illegal hostname. Try again.
+-	
+-You can use alphanumeric characters anywhere in the hostname, and 
+-you can use the minus sign (-) as long as it's not at the beginning or end." \
+-	--entry-text=$"$HOSTNAME" --width=500 --button=$"OK":0)
+-	test_hostname	
+-}
+-
+-
+-test_hostname () {
+-  if [[ -z $new_hostname ]]; then
+-    new_hostname="$HOSTNAME"
+-  fi
+-	if [[ ! "$new_hostname" =~ (^[a-zA-Z0-9]([a-zA-Z0-9]|-)+[a-zA-Z0-9]$) ]]; then
+-		fix_hostname
+-	fi
+-  hostname_len=${#new_hostname}
+-  if [[ $hostname_len -gt 63 ]]; then
+-    fix_hostname
+-  fi
+-}
++# (hostname helpers fix_hostname / test_hostname are defined earlier, before
++#  the Summary, so auto_mode can validate the hostname up front.)
+ 
+ 
+ # do hostname
+ if [[ $new_hostname != $HOSTNAME ]]; then
+-	test_hostname
++	[[ $auto_mode = "yes" ]] || test_hostname
+ 	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
+ 	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
+ fi
+@@ -2053,72 +2857,19 @@
+ 
+ ## passwords ##
+ 
+-clean_log() {
+-	
+-	# clear the log of plain-text passwords
+-	if [ -n "$newpass" ]; then
+-		sed -i "s|$newpass|\*\*\*\*|"g $error_log
+-	fi
+-	
+-	if [ -n "$confirm_newpass" ]; then
+-		sed -i "s|$confirm_newpass|\*\*\*\*|"g $error_log
+-	fi
+-	newpass=""
+-	confirm_newpass=""
+-}
+-
+-pass_error() {
+-	
+-	clean_log
+-	use_existing=""
+-	disable_root=""
+-
+-	yad --title=$"Configure $pass_dialog password" --center --borders=10 --image="gtk-dialog-error" --width=320 --button=$"OK":0 \
+-	--text=$"  Passwords do not match (or checkbox error)  \n\n  Please try again  "
+-}
+-
+-configure_pass() {
+-
+-	clean_log
+-	
+-	pass_entry=$(yad --form --title=$"Configure $pass_dialog password" --center --borders=10 --button=$"OK":0 \
+-	--text=$"You should reset the $pass_dialog password.\nUse TAB to change fields." \
+-	--field=$"Enter new $pass_dialog password::H" \
+-	--field=$"Confirm new $pass_dialog password::H"  \
+-	--field=$"Use current password\? (not recommended)":CHK)
+-	
+-	# TODO check for illegal characters?
+-	
+-	newpass=$(echo $pass_entry|awk -F "|" '{print $1}')
+-	confirm_newpass=$(echo $pass_entry|awk -F "|" '{print $2}')
+-	use_existing=$(echo $pass_entry|awk -F "|" '{print $3}')
+-	disable_root=$(echo $pass_entry|awk -F "|" '{print $4}')
+-
+-	if [ "$use_existing" = "TRUE" ] && [ "$disable_root" = "TRUE" ] ; then
+-	pass_error
+-	configure_pass
+-	fi
+-
+-	if [ -n "$newpass" ] && [ "$use_existing" = "TRUE" ]; then
+-	pass_error
+-	configure_pass
+-	fi
+-
+-	if [ "$use_existing" = "TRUE" ] || [ "$disable_root" = "TRUE" ] ; then
+-	return
+-	fi
+-
+-	if [ -z "$newpass" ] || [ "$newpass" != "$confirm_newpass" ]; then
+-	pass_error
+-	configure_pass
+-	fi
+-}
++# (clean_log / pass_error / configure_pass are defined earlier, before the
++#  Summary, so auto_mode can collect the password(s) up front. set_rootpass /
++#  set_userpass below still apply them to /target.)
+ 
+ # do root password
+ set_rootpass() {
+ 
+-	pass_dialog=root
+-	configure_pass
++	if [[ $auto_mode = "yes" ]]; then
++		newpass="$root_newpass"
++	else
++		pass_dialog=root
++		configure_pass
++	fi
+ 
+ 
  	if [ -n "$newpass" ]; then
- 		sed -i "s|$newpass|\*\*\*\*|"g $error_log
-+		[[ -n "$_target_error_log" && -f "$_target_error_log" ]] && sed -i "s|$newpass|\*\*\*\*|"g "$_target_error_log"
- 	fi
- 	
- 	if [ -n "$confirm_newpass" ]; then
- 		sed -i "s|$confirm_newpass|\*\*\*\*|"g $error_log
-+		[[ -n "$_target_error_log" && -f "$_target_error_log" ]] && sed -i "s|$confirm_newpass|\*\*\*\*|"g "$_target_error_log"
- 	fi
- 	newpass=""
- 	confirm_newpass=""
-@@ -2166,6 +2808,14 @@
+@@ -2133,8 +2884,12 @@
+ # do user password
+ set_userpass() {
+ 
+-	pass_dialog=user
+-	configure_pass
++	if [[ $auto_mode = "yes" ]]; then
++		newpass="$user_newpass"
++	else
++		pass_dialog=user
++		configure_pass
++	fi
+ 
+ 	if [ -n "$newpass" ]; then
+ 		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
+@@ -2166,6 +2921,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
