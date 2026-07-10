@@ -66,7 +66,7 @@ A one-time, idempotent setup script (safe to re-run, each step checks state and 
 **Preparation Step 2: Apply the patches.**
 
 ```bash
-# btrfs support for refractainstaller (v9.6.6 → v9.6.6.12)
+# btrfs support for refractainstaller (v9.6.6 → v9.6.6.13)
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 
 # default "seed /etc/skel + UEFI" snapshot mode for refractasnapshot
@@ -77,14 +77,14 @@ Two standard unified diffs.
 
 <details>
 
-**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, and (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended.
+**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, and (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there).
 
 **`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below).
 
 See the [Developers](#developers) section for the full version history.
 </details>
 
-Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.12/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
+Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.13/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
 
 ## Usage (every time you want to pack an ISO)
 
@@ -207,7 +207,7 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 | `btrfs-support-for-refractainstaller.patch` | The patch. Applied against the **pristine** 9.6.6 scripts (not the installed copies, which can be stale). Patches `refractainstaller-yad` + `refractainstaller` and creates the shared library. |
 | `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
 | `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
-| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.12/`), including `btrfs-disk-lib.sh`. |
+| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.13/`), including `btrfs-disk-lib.sh`. |
 | `skel-seed-for-refractasnapshot.patch` | The patch that folds `/etc/skel` seeding into refractasnapshot. Applied against the **pristine** 10.4.3/10.4.1 scripts. Patches `refractasnapshot` + `refractasnapshot-gui` and creates the shared library. |
 | `skel-seed-lib.sh` | **Single source of truth** for `/etc/skel` seeding. Defines the dotfile / config / app-data arrays and the copy logic. The patch installs it to `/usr/lib/refractasnapshot/skel-seed-lib.sh`; the standalone seed script sources it (falling back to a copy beside itself). Edit the arrays here and the snapshot tools + the standalone script all follow. |
 | `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.1/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`. |
@@ -443,6 +443,19 @@ v12 consolidates all of that for the **Automated btrfs install** path (`auto_mod
 - After you click *Proceed* on the Summary, the rest — locale, copy, swap, GRUB, user config, passwords — runs with **no further prompts**. You can walk away and come back to a finished install.
 
 Mechanics: the six dialog/collection helpers (`clean_log`, `pass_error`, `configure_pass`, `username_dialog`, `fix_hostname`, `test_hostname`) are relocated *verbatim* to above the Summary (bash needs a function defined before it's called, and these previously lived only in the post-copy tail). Passwords are collected with `set -x` paused, so the plain text never reaches the log; the collect phase deliberately does **not** run `clean_log` (its `sed -i` swaps the log's inode and would detach the redirected stderr, silencing the rest of the install) and re-attaches stderr afterwards as a safety net. (CLI and `btrfs-disk-lib.sh` are unchanged in v12.)
+
+*Validated on real hardware:* an automated run's log showed every dialog collapsed into one up-front window (mode → layout → subvolumes → hostname/username → user password → Summary), then a fully unattended tail (cleanup → copy → swap → GRUB → password applied → done), no post-copy prompts, and the installed login worked.
+
+</details>
+
+<details>
+<summary><b>v13 — custom mode also asks hostname/username/passwords up front (GUI)</b></summary>
+
+v12 fixed the walk-away problem for automated installs; v13 brings the same up-front collection to the **Custom - all options** path. Previously custom mode still interleaved: after the copy it asked the bootloader question, *then* the hostname/username, *then* the password(s).
+
+v13 makes the v12 collect phase run for **both** modes — the hostname/username and password dialog(s) are asked before the copy in custom mode too. After you click *Proceed* on the Summary, the only remaining custom-mode prompt is the **"Install Bootloader" dialog**, which is deliberately left in the tail: two of its options — *Chroot* (opens an xterm inside the copied `/target`) and *Copy files* (copies grub packages into `/target`) — need the populated `/target` and can't run before the copy. Automated mode still skips the bootloader dialog entirely (always installs GRUB), exactly as in v12.
+
+Mechanics: the `if [[ $auto_mode = "yes" ]]` gate around the v12 collect phase is removed so it runs unconditionally; the now-redundant tail `username_dialog` and hostname-legality (`test_hostname`) calls are dropped; and `set_rootpass`/`set_userpass` always apply the pre-collected password (the `auto_mode` branch is collapsed away). The password/logging safety (xtrace paused during collection, no up-front `clean_log`, stderr re-attached) is inherited unchanged from v12. Not touched: the LUKS passphrase (encrypted installs) and optional filesystem-label prompts still fire after *Proceed* but before the copy — they were already pre-copy and are config-specific. (CLI and `btrfs-disk-lib.sh` are unchanged in v13.)
 
 </details>
 

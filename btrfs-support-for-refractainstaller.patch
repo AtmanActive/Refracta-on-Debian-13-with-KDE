@@ -1,56 +1,54 @@
 From: Refracta user
-Date: 2026-07-09
-Subject: [PATCH v12] GUI installer: automated mode asks everything up front, then runs unattended
+Date: 2026-07-10
+Subject: [PATCH v13] GUI installer: custom mode also asks hostname/username/passwords up front
 
-Building on v1-v11. v11 instrumented the GUI installer so the log shows exactly
-WHEN each dialog appeared; the log of a real automated run confirmed the UX
-problem: after the up-front option/disk dialogs the installer does a long copy
-(~3.5 min of rsync) and only THEN asks the bootloader question, the hostname/
-username, and the password(s). The user cannot walk away - they return to more
-prompts and more waiting.
+Building on v1-v12. v12 consolidated the "Automated btrfs install" path
+(auto_mode) so the hostname/username and password dialogs are asked BEFORE the
+long copy and the install then runs unattended. A real automated run on
+hardware confirmed the whole install collapsed into one up-front dialog window
+(the old ~78-min idle gap on a post-copy prompt was gone) and the installed
+login worked.
 
-v12 fixes this for the "Automated btrfs install" path (auto_mode) only. Custom
-mode is unchanged.
+v13 extends the SAME up-front collection to Custom mode ("Custom - all
+options"). Previously custom mode still interleaved: after the long copy it
+asked the bootloader question, then the hostname/username, then the
+password(s). Now the hostname/username and password prompts are collected up
+front for custom mode too, so after the Summary's "Proceed" the only remaining
+custom-mode prompt is the bootloader dialog.
 
-What changes (auto_mode only):
+What changes (v13, GUI installer only):
 
-  - The hostname/username dialog and the password dialog(s) are now asked BEFORE
-    the copy, in a single collect phase placed just before the Summary, so the
-    Summary is the true final "last chance" gate. Their answers are remembered
-    in variables (new_hostname/newname/.../user_newpass/root_newpass) and applied
-    unattended in the install tail.
-  - The post-copy "Install Bootloader" dialog is skipped: automated mode already
-    promises no expert questions, so GRUB is always installed (answer=3).
-  - The tail's dialog calls are guarded so auto_mode never re-prompts: the
-    username dialog, the hostname-legality check, and set_rootpass/set_userpass
-    use the pre-collected values instead of showing a dialog.
+  - The collect phase added in v12 (just before the Summary) now runs for BOTH
+    automated and custom mode - its `if [[ $auto_mode = "yes" ]]` gate is
+    removed. It asks the hostname/username dialog and the password dialog(s) and
+    remembers the answers (new_hostname/newname/.../user_newpass/root_newpass).
+  - The tail's post-copy username dialog and hostname-legality check are dropped
+    (both modes now collect up front), and set_rootpass/set_userpass always
+    apply the pre-collected password instead of branching on auto_mode.
+  - The "Install Bootloader" dialog is DELIBERATELY LEFT in the tail for custom
+    mode (unchanged): two of its options - Chroot (opens an xterm inside the
+    copied /target) and "Copy files" (copies grub packages into /target) -
+    require the populated /target and cannot run before the copy. Automated mode
+    still skips it (always installs GRUB, answer=3), exactly as in v12.
 
-How it is done (mechanics):
+Not changed by v13: the LUKS passphrase (encrypted custom installs) and the
+optional filesystem-label prompts still fire after "Proceed" but before the
+copy (during formatting); they were already pre-copy and are config-specific,
+so they are left where they are.
 
-  - The dialog/collection helpers (clean_log, pass_error, configure_pass,
-    username_dialog, fix_hostname, test_hostname) are relocated verbatim to just
-    before the Summary. Bash needs a function defined before it is called, and
-    these were previously defined only in the tail (after the copy); moving them
-    up lets the collect phase call them. Custom mode calls them from the same
-    tail sites as before - behaviour is identical, only the definition point
-    moved.
-  - Passwords: the collect phase pauses xtrace (set +x) around the password
-    dialogs so the plain text never reaches the log at all, and remembers each
-    password in memory for the tail to apply (where the existing clean_log still
-    scrubs the apply-time traces). It deliberately does NOT run clean_log up
-    front: clean_log scrubs with `sed -i`, which swaps the log file's inode and
-    would detach the script's redirected stderr, silencing the rest of the
-    install. As a safety net the collect phase re-attaches stderr
-    (exec 2>>"$error_log") after the dialogs in case a mismatched-password retry
-    ran pass_error->clean_log.
+Password/logging safety is unchanged from v12: the collect phase pauses xtrace
+(set +x) around the password dialogs so plain text never reaches the log, does
+NOT run clean_log up front (its `sed -i` swaps the log inode and would detach
+the script's redirected stderr, silencing the rest of the install), and
+re-attaches stderr (exec 2>>"$error_log") after the dialogs. The tail's
+existing clean_log still scrubs the apply-time traces.
 
-Changes from v11:
-  - refractainstaller-yad: relocate the six dialog/collection helpers above the
-    Summary; add an auto_mode collect phase (username + password[s]); skip the
-    bootloader dialog in auto_mode (always install GRUB); guard the tail
-    username/hostname/password sites so auto_mode applies the collected answers
-    without re-prompting. Custom mode unchanged.
-  - (refractainstaller CLI and btrfs-disk-lib.sh unchanged from v9/v10/v11.)
+Changes from v12:
+  - refractainstaller-yad: de-gate the collect phase so it runs for both modes;
+    remove the now-redundant tail username_dialog and test_hostname calls;
+    collapse the auto_mode branch in set_rootpass/set_userpass to always use the
+    collected password. The bootloader dialog and everything else are unchanged.
+  - (refractainstaller CLI and btrfs-disk-lib.sh unchanged from v9-v12.)
 
 ---
 --- a/usr/bin/refractainstaller-yad
@@ -437,11 +435,11 @@ Changes from v11:
 +fi
 +
 +fi   # end: expert installation-options screen (skipped in automated mode)
-+
  
-+## Partition a disk #####
  
 -## Partition a disk ##### 
++## Partition a disk #####
++
 +
 +# Explain the manifest-driven btrfs subvolume install flow and show an example.
 +show_btrfs_manifest () {
@@ -744,7 +742,7 @@ Changes from v11:
  fi
  
  
-@@ -977,6 +1506,147 @@
+@@ -977,6 +1506,148 @@
  
  
  
@@ -862,37 +860,38 @@ Changes from v11:
 +  fi
 +}
 +
-+# --- auto_mode: ask hostname/username + password(s) now, remember the answers ---
-+if [[ $auto_mode = "yes" ]]; then
-+	# Defaults come from the SOURCE live system: it is cloned verbatim, so the
-+	# installed /target will carry the same 1000:1000 user.
-+	oldname=$(awk -F: '/1000:1000/ { print $1 }' /etc/passwd)
-+	old_realname=$(grep "^$oldname" /etc/passwd | sed "s/,,,//" | awk -F ":" '{print $5}')
++# --- Collect hostname/username + password(s) now and apply them unattended
++# in the tail. Runs for BOTH automated and custom mode (v13). Custom mode
++# still shows the Install Bootloader dialog in the tail by design; only the
++# hostname/username/password prompts are hoisted up front here. ---
++# Defaults come from the SOURCE live system: it is cloned verbatim, so the
++# installed /target will carry the same 1000:1000 user.
++oldname=$(awk -F: '/1000:1000/ { print $1 }' /etc/passwd)
++old_realname=$(grep "^$oldname" /etc/passwd | sed "s/,,,//" | awk -F ":" '{print $5}')
 +
-+	username_dialog
-+	test_hostname
++username_dialog
++test_hostname
 +
-+	# Passwords: pause xtrace so the plain text never reaches the log at all,
-+	# then keep each one in memory for the tail to apply. No clean_log scrub is
-+	# needed here (nothing was logged); and clean_log's sed -i would swap the
-+	# log inode and detach our stderr, silencing the rest of the install.
-+	_pw_xtrace=$-
-+	{ set +x ; } 2>/dev/null
-+	pass_dialog=user ; configure_pass ; user_newpass="$newpass"
-+	if [[ $sudo_is_default != "TRUE" ]]; then
-+		pass_dialog=root ; configure_pass ; root_newpass="$newpass"
-+	fi
-+	newpass="" ; confirm_newpass=""
-+	# A mismatched-password retry can call pass_error->clean_log (sed -i), which
-+	# swaps the log inode; re-attach stderr so the tail stays logged.
-+	exec 2>>"$error_log"
-+	[[ $_pw_xtrace == *x* ]] && set -x
++# Passwords: pause xtrace so the plain text never reaches the log at all,
++# then keep each one in memory for the tail to apply. No clean_log scrub is
++# needed here (nothing was logged); and clean_log's sed -i would swap the
++# log inode and detach our stderr, silencing the rest of the install.
++_pw_xtrace=$-
++{ set +x ; } 2>/dev/null
++pass_dialog=user ; configure_pass ; user_newpass="$newpass"
++if [[ $sudo_is_default != "TRUE" ]]; then
++	pass_dialog=root ; configure_pass ; root_newpass="$newpass"
 +fi
++newpass="" ; confirm_newpass=""
++# A mismatched-password retry can call pass_error->clean_log (sed -i), which
++# swaps the log inode; re-attach stderr so the tail stays logged.
++exec 2>>"$error_log"
++[[ $_pw_xtrace == *x* ]] && set -x
 +
  # Show a summary of what will be done
  
  if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
-@@ -1251,9 +1921,49 @@
+@@ -1251,9 +1922,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -944,7 +943,7 @@ Changes from v11:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +2043,70 @@
+@@ -1333,14 +2044,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -1018,7 +1017,7 @@ Changes from v11:
  fi
  
  
-@@ -1531,9 +2297,23 @@
+@@ -1531,9 +2298,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -1043,7 +1042,7 @@ Changes from v11:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2374,12 @@
+@@ -1594,10 +2375,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1057,7 +1056,7 @@ Changes from v11:
  fi
  
  
-@@ -1674,13 +2456,28 @@
+@@ -1674,13 +2457,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -1089,7 +1088,7 @@ Changes from v11:
  fi
  
  
-@@ -1690,13 +2487,57 @@
+@@ -1690,13 +2488,57 @@
  
  
   
@@ -1150,7 +1149,7 @@ Changes from v11:
  fi
  
  
-@@ -1793,6 +2634,10 @@
+@@ -1793,6 +2635,10 @@
  fi
  
  # Pause to allow manual changes to /target for UEFI boot.
@@ -1161,7 +1160,7 @@ Changes from v11:
  df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
  	--text=$"${bios_boot_warning}
  ${grub_message}
-@@ -1808,6 +2653,7 @@
+@@ -1808,6 +2654,7 @@
  " \
  "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
  answer="$?"
@@ -1169,7 +1168,7 @@ Changes from v11:
  
  if [[ $answer = 1 ]] ; then
  	chroot_terminal
-@@ -1836,7 +2682,8 @@
+@@ -1836,7 +2683,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -1179,12 +1178,13 @@ Changes from v11:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1874,60 +2721,17 @@
+@@ -1874,60 +2722,17 @@
  oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
  old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
  
 -username_dialog() {
--
++# hostname/username collected up front (v13); nothing to ask here.
+ 
 -	newuser=$(yad --form --title=$"Configure hostname and username..." --center --borders=10 --button=$"OK":0 \
 -	--text=$"\n You should change the hostname and username \n \
 -	(optional but recommended) \n" \
@@ -1203,12 +1203,11 @@ Changes from v11:
 -	sudo_is_default=$(echo $newuser |awk -F "|" '{print $5}')
 -	sudo_shutdown=$(echo $newuser |awk -F "|" '{print $6}')
 -}
--
+ 
 -username_dialog
-+[[ $auto_mode = "yes" ]] || username_dialog
  
- 
- 
+-
+-
 -# Test to make sure new_hostname is a legal hostname, let user fix it if it's not.
 -fix_hostname () {
 -	new_hostname=$(yad --entry --title=$"Change hostname" --center --borders=10 \
@@ -1240,11 +1239,11 @@ Changes from v11:
  # do hostname
  if [[ $new_hostname != $HOSTNAME ]]; then
 -	test_hostname
-+	[[ $auto_mode = "yes" ]] || test_hostname
++	# hostname validated up front (v13).
  	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
  	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
  fi
-@@ -2053,72 +2857,19 @@
+@@ -2053,72 +2858,15 @@
  
  ## passwords ##
  
@@ -1317,31 +1316,23 @@ Changes from v11:
  
 -	pass_dialog=root
 -	configure_pass
-+	if [[ $auto_mode = "yes" ]]; then
-+		newpass="$root_newpass"
-+	else
-+		pass_dialog=root
-+		configure_pass
-+	fi
++	# password collected up front (v13); apply the remembered value.
++	newpass="$root_newpass"
  
  
  	if [ -n "$newpass" ]; then
-@@ -2133,8 +2884,12 @@
+@@ -2133,8 +2881,8 @@
  # do user password
  set_userpass() {
  
 -	pass_dialog=user
 -	configure_pass
-+	if [[ $auto_mode = "yes" ]]; then
-+		newpass="$user_newpass"
-+	else
-+		pass_dialog=user
-+		configure_pass
-+	fi
++	# password collected up front (v13); apply the remembered value.
++	newpass="$user_newpass"
  
  	if [ -n "$newpass" ]; then
  		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
-@@ -2166,6 +2921,14 @@
+@@ -2166,6 +2914,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
