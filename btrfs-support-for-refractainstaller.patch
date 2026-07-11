@@ -1,54 +1,38 @@
 From: Refracta user
-Date: 2026-07-10
-Subject: [PATCH v13] GUI installer: custom mode also asks hostname/username/passwords up front
+Date: 2026-07-11
+Subject: [PATCH v15] CLI installer: fix desktop autologin on SDDM (KDE Plasma)
 
-Building on v1-v12. v12 consolidated the "Automated btrfs install" path
-(auto_mode) so the hostname/username and password dialogs are asked BEFORE the
-long copy and the install then runs unattended. A real automated run on
-hardware confirmed the whole install collapsed into one up-front dialog window
-(the old ~78-min idle gap on a post-copy prompt was gone) and the installed
-login worked.
+Building on v1-v14. v14 fixed the SDDM desktop-autologin bug in the GUI
+installer (refractainstaller-yad) but explicitly left the CLI installer
+(refractainstaller) alone. The CLI has the SAME defect: no SDDM support at all,
+so on KDE Plasma / Debian 13 the "Disable auto-login?" prompt (which defaults to
+YES) never actually disabled autologin - /etc/sddm.conf's [Autologin] was left
+intact and cloned into the installed system.
 
-v13 extends the SAME up-front collection to Custom mode ("Custom - all
-options"). Previously custom mode still interleaved: after the long copy it
-asked the bootloader question, then the hostname/username, then the
-password(s). Now the hostname/username and password prompts are collected up
-front for custom mode too, so after the Summary's "Proceed" the only remaining
-custom-mode prompt is the bootloader dialog.
+Background (same as v14): Debian live-config /lib/live/config/0085-sddm writes
+/etc/sddm.conf ([Autologin] / User=<liveuser> / Session=plasma.desktop) at live
+boot; the installer's rsync copies it into /target. The CLI's
+set_noautologin_desktop / set_autologin_desktop handled gdm/gdm3/lightdm/kdm/
+kde-kdm/trinity/slim/lxdm/"no DM" but never /etc/sddm.conf.
 
-What changes (v13, GUI installer only):
+What changes (v15, CLI installer only):
 
-  - The collect phase added in v12 (just before the Summary) now runs for BOTH
-    automated and custom mode - its `if [[ $auto_mode = "yes" ]]` gate is
-    removed. It asks the hostname/username dialog and the password dialog(s) and
-    remembers the answers (new_hostname/newname/.../user_newpass/root_newpass).
-  - The tail's post-copy username dialog and hostname-legality check are dropped
-    (both modes now collect up front), and set_rootpass/set_userpass always
-    apply the pre-collected password instead of branching on auto_mode.
-  - The "Install Bootloader" dialog is DELIBERATELY LEFT in the tail for custom
-    mode (unchanged): two of its options - Chroot (opens an xterm inside the
-    copied /target) and "Copy files" (copies grub packages into /target) -
-    require the populated /target and cannot run before the copy. Automated mode
-    still skips it (always installs GRUB, answer=3), exactly as in v12.
+  - set_noautologin_desktop (CLI) now comments the `User=` line inside the
+    `[Autologin]` section of /target/etc/sddm.conf and /target/etc/sddm.conf.d/
+    *.conf (section-scoped `/^\[Autologin\]/,/^\[/`, so a `User=` in another
+    section is untouched).
+  - set_autologin_desktop (CLI) now rewrites `User=<olduser>` to `<newuser>` in
+    the same section(s), so "keep autologin" survives a username change.
 
-Not changed by v13: the LUKS passphrase (encrypted custom installs) and the
-optional filesystem-label prompts still fire after "Proceed" but before the
-copy (during formatting); they were already pre-copy and are config-specific,
-so they are left where they are.
+These are the exact same two blocks added to the GUI in v14. The CLI has no
+`auto_mode`, so no autologin question is needed - it already prompts
+"Disable auto-login?" (ENTER = YES) in its normal flow; only the missing SDDM
+handling was the bug.
 
-Password/logging safety is unchanged from v12: the collect phase pauses xtrace
-(set +x) around the password dialogs so plain text never reaches the log, does
-NOT run clean_log up front (its `sed -i` swaps the log inode and would detach
-the script's redirected stderr, silencing the rest of the install), and
-re-attaches stderr (exec 2>>"$error_log") after the dialogs. The tail's
-existing clean_log still scrubs the apply-time traces.
-
-Changes from v12:
-  - refractainstaller-yad: de-gate the collect phase so it runs for both modes;
-    remove the now-redundant tail username_dialog and test_hostname calls;
-    collapse the auto_mode branch in set_rootpass/set_userpass to always use the
-    collected password. The bootloader dialog and everything else are unchanged.
-  - (refractainstaller CLI and btrfs-disk-lib.sh unchanged from v9-v12.)
+Changes from v14:
+  - refractainstaller (CLI): add SDDM handling to set_noautologin_desktop and
+    set_autologin_desktop. Nothing else changes.
+  - (refractainstaller-yad and btrfs-disk-lib.sh unchanged from v14.)
 
 ---
 --- a/usr/bin/refractainstaller-yad
@@ -435,11 +419,11 @@ Changes from v12:
 +fi
 +
 +fi   # end: expert installation-options screen (skipped in automated mode)
++
  
++## Partition a disk #####
  
 -## Partition a disk ##### 
-+## Partition a disk #####
-+
 +
 +# Explain the manifest-driven btrfs subvolume install flow and show an example.
 +show_btrfs_manifest () {
@@ -742,7 +726,7 @@ Changes from v12:
  fi
  
  
-@@ -977,6 +1506,148 @@
+@@ -977,6 +1506,158 @@
  
  
  
@@ -872,6 +856,16 @@ Changes from v12:
 +username_dialog
 +test_hostname
 +
++# Automated mode skips the expert-options checklist (where custom mode asks
++# about autologin via option 12), so ask the one autologin question here.
++if [[ $auto_mode = "yes" ]]; then
++	yad --image=gtk-dialog-question --title=$"Automatic login" --center --borders=10 \
++		--text=$"Enable automatic login to the desktop for the new user\?\n\nEither way, the install runs unattended after the Summary." \
++		--button=$"Yes, autologin":0 --button=$"No, require login":1
++	_autologin_ans=$?
++	[[ $_autologin_ans = 1 ]] && disable_auto_desktop="yes"
++fi
++
 +# Passwords: pause xtrace so the plain text never reaches the log at all,
 +# then keep each one in memory for the tail to apply. No clean_log scrub is
 +# needed here (nothing was logged); and clean_log's sed -i would swap the
@@ -891,7 +885,7 @@ Changes from v12:
  # Show a summary of what will be done
  
  if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
-@@ -1251,9 +1922,49 @@
+@@ -1251,9 +1932,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -943,7 +937,7 @@ Changes from v12:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +2044,70 @@
+@@ -1333,14 +2054,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -1017,7 +1011,41 @@ Changes from v12:
  fi
  
  
-@@ -1531,9 +2298,23 @@
+@@ -1372,6 +2149,16 @@
+         sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
+     fi
+ 
++	#sddm  (KDE Plasma on Debian: live-config 0085-sddm writes /etc/sddm.conf [Autologin])
++	if [[ -f /target/etc/sddm.conf ]]; then
++		sed -i '/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)/#\1/' /target/etc/sddm.conf
++	fi
++	if [[ -d /target/etc/sddm.conf.d ]]; then
++		for _f in /target/etc/sddm.conf.d/*.conf ; do
++			[[ -f "$_f" ]] && sed -i '/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)/#\1/' "$_f"
++		done
++	fi
++
+ 	#lightdm
+ 	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
+ 		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
+@@ -1447,6 +2234,16 @@
+         sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
+     fi
+ 
++	#sddm
++	if [[ -f /target/etc/sddm.conf ]]; then
++		sed -i "/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)$oldusername/\1$newusername/" /target/etc/sddm.conf
++	fi
++	if [[ -d /target/etc/sddm.conf.d ]]; then
++		for _f in /target/etc/sddm.conf.d/*.conf ; do
++			[[ -f "$_f" ]] && sed -i "/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)$oldusername/\1$newusername/" "$_f"
++		done
++	fi
++
+ 	#lightdm
+ 	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
+ 		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
+@@ -1531,9 +2328,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -1042,7 +1070,7 @@ Changes from v12:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2375,12 @@
+@@ -1594,10 +2405,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1056,7 +1084,7 @@ Changes from v12:
  fi
  
  
-@@ -1674,13 +2457,28 @@
+@@ -1674,13 +2487,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -1088,7 +1116,7 @@ Changes from v12:
  fi
  
  
-@@ -1690,13 +2488,57 @@
+@@ -1690,13 +2518,57 @@
  
  
   
@@ -1149,7 +1177,7 @@ Changes from v12:
  fi
  
  
-@@ -1793,6 +2635,10 @@
+@@ -1793,6 +2665,10 @@
  fi
  
  # Pause to allow manual changes to /target for UEFI boot.
@@ -1160,7 +1188,7 @@ Changes from v12:
  df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
  	--text=$"${bios_boot_warning}
  ${grub_message}
-@@ -1808,6 +2654,7 @@
+@@ -1808,6 +2684,7 @@
  " \
  "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
  answer="$?"
@@ -1168,7 +1196,7 @@ Changes from v12:
  
  if [[ $answer = 1 ]] ; then
  	chroot_terminal
-@@ -1836,7 +2683,8 @@
+@@ -1836,7 +2713,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -1178,7 +1206,7 @@ Changes from v12:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1874,60 +2722,17 @@
+@@ -1874,60 +2752,17 @@
  oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
  old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
  
@@ -1243,7 +1271,7 @@ Changes from v12:
  	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
  	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
  fi
-@@ -2053,72 +2858,15 @@
+@@ -2053,72 +2888,15 @@
  
  ## passwords ##
  
@@ -1321,7 +1349,7 @@ Changes from v12:
  
  
  	if [ -n "$newpass" ]; then
-@@ -2133,8 +2881,8 @@
+@@ -2133,8 +2911,8 @@
  # do user password
  set_userpass() {
  
@@ -1332,7 +1360,7 @@ Changes from v12:
  
  	if [ -n "$newpass" ]; then
  		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
-@@ -2166,6 +2914,14 @@
+@@ -2166,6 +2944,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
@@ -1701,7 +1729,41 @@ Changes from v12:
  fi
  
  # Disallow mounting of all fixed drives with pmount
-@@ -1427,9 +1694,23 @@
+@@ -1276,6 +1543,16 @@
+ 		sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
+ 	fi
+ 
++	#sddm  (KDE Plasma on Debian: live-config 0085-sddm writes /etc/sddm.conf [Autologin])
++	if [[ -f /target/etc/sddm.conf ]]; then
++		sed -i '/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)/#\1/' /target/etc/sddm.conf
++	fi
++	if [[ -d /target/etc/sddm.conf.d ]]; then
++		for _f in /target/etc/sddm.conf.d/*.conf ; do
++			[[ -f "$_f" ]] && sed -i '/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)/#\1/' "$_f"
++		done
++	fi
++
+ 	#lightdm
+ 	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
+ 		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
+@@ -1350,6 +1627,16 @@
+         sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
+     fi
+ 
++	#sddm
++	if [[ -f /target/etc/sddm.conf ]]; then
++		sed -i "/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)$oldusername/\1$newusername/" /target/etc/sddm.conf
++	fi
++	if [[ -d /target/etc/sddm.conf.d ]]; then
++		for _f in /target/etc/sddm.conf.d/*.conf ; do
++			[[ -f "$_f" ]] && sed -i "/^\[Autologin\]/,/^\[/ s/^\([[:space:]]*User=\)$oldusername/\1$newusername/" "$_f"
++		done
++	fi
++
+ 	#lightdm
+ 	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
+ 		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
+@@ -1427,9 +1714,23 @@
  	fi
  fi
  echo -e $"\n Creating /etc/fstab...\n"
@@ -1726,7 +1788,7 @@ Changes from v12:
  
  # add entry for /home to fstab if needed
  if [[ -n $home_part ]] ; then
-@@ -1463,10 +1744,12 @@
+@@ -1463,10 +1764,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1740,7 +1802,7 @@ Changes from v12:
  fi
  
  
-@@ -1524,9 +1807,17 @@
+@@ -1524,9 +1827,17 @@
  mount --bind /proc/ /target/proc/ ; check_exit 
  mount --bind /sys/ /target/sys/ ; check_exit 
  
@@ -1760,7 +1822,7 @@ Changes from v12:
  fi
  
  # This test is not complete and should probably be done earlier. grub_dev="efi" above
-@@ -1543,15 +1834,68 @@
+@@ -1543,15 +1854,68 @@
  	fi
      echo -e $"\n Adding esp entry to fstab...\n"
      echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
@@ -1832,7 +1894,7 @@ Changes from v12:
  
  
  #grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
-@@ -1658,8 +2002,10 @@
+@@ -1658,8 +2022,10 @@
  done
  
  
@@ -1845,7 +1907,7 @@ Changes from v12:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1918,6 +2264,14 @@
+@@ -1918,6 +2284,14 @@
  fi
  
  

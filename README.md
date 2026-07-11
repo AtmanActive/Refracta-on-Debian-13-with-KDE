@@ -66,7 +66,7 @@ A one-time, idempotent setup script (safe to re-run, each step checks state and 
 **Preparation Step 2: Apply the patches.**
 
 ```bash
-# btrfs support for refractainstaller (v9.6.6 → v9.6.6.13)
+# btrfs support for refractainstaller (v9.6.6 → v9.6.6.15)
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 
 # default "seed /etc/skel + UEFI" snapshot mode for refractasnapshot
@@ -77,14 +77,14 @@ Two standard unified diffs.
 
 <details>
 
-**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, and (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there).
+**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, and (v15) the same SDDM autologin fix ported to the CLI installer.
 
 **`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below).
 
 See the [Developers](#developers) section for the full version history.
 </details>
 
-Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.13/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
+Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.15/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
 
 ## Usage (every time you want to pack an ISO)
 
@@ -207,7 +207,7 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 | `btrfs-support-for-refractainstaller.patch` | The patch. Applied against the **pristine** 9.6.6 scripts (not the installed copies, which can be stale). Patches `refractainstaller-yad` + `refractainstaller` and creates the shared library. |
 | `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
 | `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
-| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.13/`), including `btrfs-disk-lib.sh`. |
+| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.15/`), including `btrfs-disk-lib.sh`. |
 | `skel-seed-for-refractasnapshot.patch` | The patch that folds `/etc/skel` seeding into refractasnapshot. Applied against the **pristine** 10.4.3/10.4.1 scripts. Patches `refractasnapshot` + `refractasnapshot-gui` and creates the shared library. |
 | `skel-seed-lib.sh` | **Single source of truth** for `/etc/skel` seeding. Defines the dotfile / config / app-data arrays and the copy logic. The patch installs it to `/usr/lib/refractasnapshot/skel-seed-lib.sh`; the standalone seed script sources it (falling back to a copy beside itself). Edit the arrays here and the snapshot tools + the standalone script all follow. |
 | `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.1/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`. |
@@ -456,6 +456,40 @@ v12 fixed the walk-away problem for automated installs; v13 brings the same up-f
 v13 makes the v12 collect phase run for **both** modes — the hostname/username and password dialog(s) are asked before the copy in custom mode too. After you click *Proceed* on the Summary, the only remaining custom-mode prompt is the **"Install Bootloader" dialog**, which is deliberately left in the tail: two of its options — *Chroot* (opens an xterm inside the copied `/target`) and *Copy files* (copies grub packages into `/target`) — need the populated `/target` and can't run before the copy. Automated mode still skips the bootloader dialog entirely (always installs GRUB), exactly as in v12.
 
 Mechanics: the `if [[ $auto_mode = "yes" ]]` gate around the v12 collect phase is removed so it runs unconditionally; the now-redundant tail `username_dialog` and hostname-legality (`test_hostname`) calls are dropped; and `set_rootpass`/`set_userpass` always apply the pre-collected password (the `auto_mode` branch is collapsed away). The password/logging safety (xtrace paused during collection, no up-front `clean_log`, stderr re-attached) is inherited unchanged from v12. Not touched: the LUKS passphrase (encrypted installs) and optional filesystem-label prompts still fire after *Proceed* but before the copy — they were already pre-copy and are config-specific. (CLI and `btrfs-disk-lib.sh` are unchanged in v13.)
+
+</details>
+
+<details>
+<summary><b>v14 — fix desktop autologin on SDDM (KDE Plasma) + ask in automated mode (GUI)</b></summary>
+
+A real automated install on Debian 13 + KDE Plasma always booted straight into the desktop with autologin, no matter what — and older tests showed that even ticking *"Disable automatic login to desktop"* in custom mode didn't stop it. **Root cause: neither installer had any support for SDDM**, the display manager KDE Plasma uses on Debian 13 (`grep -c sddm` was `0` in both).
+
+The live autologin is created by Debian live-config's `/lib/live/config/0085-sddm`, which writes `/etc/sddm.conf`:
+
+```ini
+[Autologin]
+User=<liveuser>
+Session=plasma.desktop
+```
+
+That file is part of the running live filesystem, so the installer's rsync copies it into `/target`. The installer's `set_noautologin_desktop` / `set_autologin_desktop` handle gdm/gdm3/lightdm/kdm/kde-kdm/trinity/slim/lxdm and "no display manager" — but never `/etc/sddm.conf`. So on KDE/SDDM the autologin was never modifiable: custom mode's "disable" ran `set_noautologin_desktop` (which did nothing for SDDM), and automated mode skipped the whole checklist and kept autologin without ever asking.
+
+v14 fixes it:
+
+- **`set_noautologin_desktop`** now comments the `User=` line inside the `[Autologin]` section of `/target/etc/sddm.conf` (and `/target/etc/sddm.conf.d/*.conf`), so SDDM shows the normal greeter. The edit is section-scoped (`/^\[Autologin\]/,/^\[/`), so a `User=` key in another section is never touched.
+- **`set_autologin_desktop`** now rewrites `User=<olduser>` → `<newuser>` in the same section, so "keep autologin" survives a username change.
+- **Automated mode now asks.** Because the expert checklist (where the autologin option lives) is skipped in `auto_mode`, a single yad question — *"Enable automatic login to the desktop for the new user?"* — is added to the up-front collect phase, guarded by `[[ $auto_mode = "yes" ]]` so custom mode (which still asks via the checklist) is unaffected.
+
+Note: the CLI installer had the **same** missing-SDDM bug — fixed in v15 below. (`btrfs-disk-lib.sh` is unchanged in v14.)
+
+</details>
+
+<details>
+<summary><b>v15 — same SDDM autologin fix, ported to the CLI installer</b></summary>
+
+v14 fixed SDDM autologin in the GUI installer only. The CLI installer (`refractainstaller`) has the identical defect: its "Disable auto-login?" prompt (ENTER = YES) called `set_noautologin_desktop`, which — like the GUI's before v14 — had no SDDM branch, so on KDE/Debian 13 the autologin was never disabled.
+
+v15 adds the **exact same two blocks** to the CLI's `set_noautologin_desktop` (comment `User=` under `[Autologin]` in `/etc/sddm.conf` + `/etc/sddm.conf.d/*.conf`) and `set_autologin_desktop` (rename `User=` there). The CLI has no automated (`auto_mode`) flow, so no extra question is needed — it already prompts about autologin in its normal sequence; only the missing SDDM handling was the bug. (`refractainstaller-yad` and `btrfs-disk-lib.sh` are unchanged in v15.)
 
 </details>
 

@@ -1,0 +1,2285 @@
+#!/usr/bin/env bash
+
+version="refractainstaller  9.6.6 (20230428)"
+
+TEXTDOMAIN=refractainstaller-base
+export TEXTDOMAIN
+TEXTDOMAINDIR=/usr/share/locale
+export TEXTDOMAINDIR
+
+# Copyright 2011-2021 fsmithred@gmail.com
+# Portions may be copyright Dean Linkous and/or David Hare and/or others.
+# Based on refractainstaller-8.0.3 by Dean Linkous
+# Licence: GPL-3
+# This is free software with no warrantees. Use at your own risk.
+
+# This script will install a refracta live-cd to a hard drive. It gives
+# you the option to install the entire system to one partition or to
+# install with /home on a separate partition. 
+
+# NOTE: If you try to tee this to an install log, you won't see it
+# when cryptsetup asks you to confirm with YES.
+
+
+
+# If you want to change any defaults, change them in the configfile.
+# Default is /etc/refractainstaller.conf
+# If you want to use a different config file for testing, change this
+# variable. Normally, users should not edit anything in this script.
+configfile="/etc/refractainstaller.conf"
+
+# btrfs subvolume layout.
+#
+# The installer LEARNS the real layout from the disk instead of hard-coding it:
+# the disk-setup script writes a small manifest at the btrfs top level
+# (subvolid=5), named by $btrfs_layout_manifest, with one TAB-separated
+# "<subvolume><TAB><mountpoint>" line per subvolume. load_btrfs_layout() reads
+# it into the arrays below, so ANY subvolume scheme works with no edits here.
+#
+# The arrays below are only the FALLBACK used when no manifest is present (e.g.
+# when formatting via the installer's own "btrfs (with subvolumes)" menu).
+btrfs_layout_manifest=".refracta-btrfs-layout"
+btrfs_subvols=( @rootfs @home @var @tmp @snapshots )
+btrfs_subvol_mounts=( "/" "/home" "/var" "/tmp" "/.snapshots" )
+btrfs_root_subvol="@rootfs"   # the subvolume mounted at "/" (overridden by manifest)
+btrfs_layout_source="default" # "manifest", "guessed", or "default" (for messages)
+
+# btrfs_guess_mount SUBVOL
+#   Best-effort mountpoint for a subvolume name when no manifest exists.
+#   Known names are mapped explicitly; unknown "@a_b_c" become "/a/b/c".
+btrfs_guess_mount () {
+	case "$1" in
+		@rootfs|@root|@)  echo "/" ;;
+		@home)            echo "/home" ;;
+		@snapshots)       echo "/.snapshots" ;;
+		@swap)            echo "/swap" ;;
+		@var)             echo "/var" ;;
+		@var_log)         echo "/var/log" ;;
+		@var_cache)       echo "/var/cache" ;;
+		@libvirt_images)  echo "/var/lib/libvirt/images" ;;
+		@tmp)             echo "/tmp" ;;
+		@opt)             echo "/opt" ;;
+		@srv)             echo "/srv" ;;
+		@*)               local _n="${1#@}" ; echo "/${_n//_//}" ;;
+		*)                echo "" ;;
+	esac
+}
+
+# load_btrfs_layout DEVICE
+#   Learn the btrfs subvolume layout of DEVICE by mounting its top level
+#   (subvolid=5) and either (1) reading the layout manifest if present
+#   (authoritative), or (2) discovering the existing subvolumes with
+#   `btrfs subvolume list` and guessing their mountpoints by convention.
+#   Populates btrfs_subvols / btrfs_subvol_mounts (sorted shallow-first so
+#   parent mounts precede children) and btrfs_root_subvol / btrfs_layout_source.
+#   Returns 0 if any subvolumes were found (=> subvol mode), 1 otherwise.
+load_btrfs_layout () {
+	local _dev="$1" _tmp _raw="" _src="default" _rc=1 _sv _mp _i
+	_tmp=$(mktemp -d)
+	mount -o subvolid=5 "$_dev" "$_tmp" 2>/dev/null || { rmdir "$_tmp"; return 1; }
+	if [[ -f "$_tmp/$btrfs_layout_manifest" ]]; then
+		_raw=$(awk -F'\t' '/^[[:space:]]*#/{next} NF<2{next} {print $1"\t"$2}' "$_tmp/$btrfs_layout_manifest")
+		_src="manifest"
+	else
+		_raw=$(btrfs subvolume list "$_tmp" 2>/dev/null | awk '{print $NF}' \
+			| while read -r _s; do
+				[[ "$_s" == */* ]] && continue   # skip nested subvolumes
+				printf '%s\t%s\n' "$_s" "$(btrfs_guess_mount "$_s")"
+			done)
+		_src="guessed"
+	fi
+	umount "$_tmp" 2>/dev/null; rmdir "$_tmp"
+
+	if [[ -n "$_raw" ]]; then
+		btrfs_subvols=(); btrfs_subvol_mounts=()
+		while IFS=$'\t' read -r _ _sv _mp; do
+			[[ -z "$_sv" || -z "$_mp" ]] && continue
+			btrfs_subvols+=("$_sv"); btrfs_subvol_mounts+=("$_mp")
+		done < <(printf '%s\n' "$_raw" | awk -F'\t' 'NF>=2 && $2!="" {d=gsub(/\//,"/",$2); print d"\t"$1"\t"$2}' | sort -n -k1,1)
+		if [[ ${#btrfs_subvols[@]} -gt 0 ]]; then
+			btrfs_root_subvol="@rootfs"
+			for _i in "${!btrfs_subvols[@]}"; do
+				[[ "${btrfs_subvol_mounts[$_i]}" == "/" ]] && btrfs_root_subvol="${btrfs_subvols[$_i]}"
+			done
+			btrfs_layout_source="$_src"
+			_rc=0
+		fi
+	fi
+	return $_rc
+}
+
+
+show_help () {
+	programname="$0"
+	echo $"
+	Usage:  $programname  [option]
+
+	Run with no options to install a live-CD/DVD/USB to hard drive. 
+
+	If you want to use the graphical version, run refractainstaller-gui
+	from a terminal or run Refracta Installer from the System menu.
+
+	valid options:
+		-h, --help		show this help text
+		-v, --version	display the version information
+		-d. --debug		debug mode
+		--btrfs-manifest	explain the btrfs subvolume manifest flow + example
+
+"
+}
+
+# Explain the manifest-driven btrfs subvolume install flow and show an example.
+show_btrfs_manifest () {
+cat <<'EOF'
+
+ Refracta - btrfs subvolume layout via a manifest
+ ================================================
+
+ Install onto a btrfs disk that YOU partitioned and formatted, without the
+ installer reformatting it. The installer learns your subvolume layout from a
+ small manifest file on the disk, so any subvolume scheme works.
+
+ STEPS
+  1. Create partitions, run mkfs.btrfs, and create your subvolumes.
+  2. Put a manifest at the btrfs TOP LEVEL (subvolid=5), named:
+        .refracta-btrfs-layout
+     One line per subvolume:   <subvolume><TAB><mountpoint>
+     ('#' begins a comment. Columns MUST be separated by a real TAB.)
+  3. Start the install and tick "Do not format filesystems",
+     then choose your btrfs partition as the root device.
+
+ The installer then automatically:
+   - mounts each subvolume at its mountpoint (parents before children),
+   - uses the subvolume mapped to "/" as root,
+   - writes /etc/fstab (every subvolume shares the partition UUID),
+   - creates a RAM-sized, NoCoW swapfile in the @swap subvolume,
+   - configures hibernation (resume= / resume_offset=).
+ If no manifest is found but subvolumes exist, it falls back to discovering
+ them and guessing mountpoints from their names.
+
+ EXAMPLE  .refracta-btrfs-layout   (the gap in each line is a single TAB)
+   # <subvolume>        <mountpoint>
+   @rootfs              /
+   @home                /home
+   @var_log             /var/log
+   @var_cache           /var/cache
+   @libvirt_images      /var/lib/libvirt/images
+   @swap                /swap
+   @tmp                 /tmp
+   @snapshots           /.snapshots
+
+ CREATE IT BY HAND  (example device /dev/sdaX - adjust!)
+   mkfs.btrfs -L btrfs-root /dev/sdaX
+   mount -o subvolid=5 /dev/sdaX /mnt
+   for s in @rootfs @home @var_log @var_cache @libvirt_images @swap @tmp @snapshots; do
+       btrfs subvolume create /mnt/$s
+   done
+   printf '%s\t%s\n' \
+     @rootfs / @home /home @var_log /var/log @var_cache /var/cache \
+     @libvirt_images /var/lib/libvirt/images @swap /swap \
+     @tmp /tmp @snapshots /.snapshots > /mnt/.refracta-btrfs-layout
+   umount /mnt
+
+ The project's disk_setup_for_btrfs_desktop_subvolumes.sh does all of the
+ above for you (partitions, subvolumes, and the manifest).
+
+EOF
+}
+
+while [[ $1 == -* ]]; do
+	option="$1"
+	case "$option" in
+	
+		-h|--help)
+			show_help 
+			exit 0 ;;
+		
+		-v|--version)
+			printf "\n$version\n\n" 
+			exit 0 ;;
+			
+		-d|--debug)
+			DEBUG="yes"
+			break ;;
+
+		--btrfs-manifest)
+			show_btrfs_manifest
+			exit 0 ;;
+		
+		*) echo $"
+	invalid option: $option \n\n
+	Try:  $programname -h for full help. \n\n"
+			exit 1 ;;
+    esac
+done		
+
+
+# Check that user is root.
+if [[ $(id -u) -ne 0 ]] ; then
+	echo $"	You need to be root!"
+	exit 1
+fi
+
+# Fix root's path (for Buster/Beowulf and later)
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Check for config file.
+if [[ -f $configfile ]]; then
+    source $configfile
+else
+	echo $"
+	Config file $configfile is missing
+	Exiting...
+"
+	exit 1
+fi
+
+
+# Record errors in a logfile.
+exec 2>"$error_log"
+
+if [[ $DEBUG = "yes" ]] ; then
+	set -x
+fi
+
+
+# Check to be sure we're running a live session; give warning if not.
+if [[ ! -d /lib/live/mount/medium ]] && [[ ! -d /lib/live/mount/findiso ]] && [[ ! -d /lib/live/mount/fromiso ]] && [[ ! -d /lib/live/mount/persistence ]] && [[ ! -d /run/live/medium ]] ; then
+	echo $"
+	###	WARNING: Not running from live-CD or live-USB	### 
+	###	or unsupported configuration. Be sure you know	### 
+	###	what you are doing. This may not work.		### 
+
+	Press ENTER to proceed or ctrl-c to exit. " ; read -p " "
+fi
+
+# Run pre-install scripts if enabled in config file.
+if [[ $run_preinstall = "yes" ]] ; then
+	for file in /usr/lib/refractainstaller/pre-install/* ; do
+		if [[ -x $file ]] ; then
+			bash $file
+		fi
+	done
+fi
+
+
+# function to exit the script if there are errors
+check_exit () {
+	exit_code="$?"
+if [[ $exit_code -ne 0 ]] ; then
+	echo $"
+	Exit due to error:  $exit_code
+	See $error_log for details.
+"
+	exit 1
+fi
+}
+
+
+# Check that rsync excludes file exists, or create one.
+if ! [[ -f  $rsync_excludes ]] ; then
+    echo $"
+ There is no rsync excludes file, or its name does not match what
+ this script expects. You should let the script create one, or if
+ you have a custom excludes file, and you know what you're doing,
+ you can exit the script and edit the rsync_excludes variable in 
+ the config file to match the name and path of your custom file.
+
+ Press ENTER to proceed or hit ctrl-c to exit. "
+	read -p ""
+
+	rsync_excludes="$(pwd)/installer_exclude.list"
+	echo $"
+	Creating rsync excludes file, $rsync_excludes
+"
+	sleep 2
+    cat > "$rsync_excludes" <<EOF
+# It is safe to delete this file after installation.
+
+- /dev/*
+- /cdrom/*
+- /media/*
+- /target
+- /swapfile
+- /mnt/*
+- /sys/*
+- /proc/*
+- /tmp/*
+- /live
+- /boot/grub/grub.cfg
+- /boot/grub/menu.lst
+- /boot/grub/device.map
+- /etc/udev/rules.d/70-persistent-cd.rules
+- /etc/udev/rules.d/70-persistent-net.rules
+- /etc/fstab
+- /etc/mtab
+- /home/snapshot
+- /home/*/.gvfs
+- /var/lib/dbus/machine-id
+- /etc/popularity-contest.conf
+
+# Added for newer version of live-config/live-boot
+# in sid (to become Jessie)
+- /lib/live/overlay
+- /lib/live/image
+- /lib/live/rootfs
+- /lib/live/mount
+- /run/*
+
+# Added for symlink /lib
+- /usr/lib/live/overlay
+- /usr/lib/live/image
+- /usr/lib/live/rootfs
+- /usr/lib/live/mount
+
+EOF
+check_exit
+chmod 666 "$rsync_excludes"
+fi 
+
+
+###  UEFI TESTS
+
+# Test for efi boot
+# Test for esp partition, test for gpt partition table
+# Test for grub version
+
+show_installer_help () {
+
+	zless "$installer_help"
+
+	while true ; do		
+		echo $"
+	Now that you know what you're doing...
+	
+	1) Continue
+	2) Abort the installation
+"
+	read ans
+		case "$ans" in
+			1) break ;;
+			2) exit 0 ;;
+		esac
+	done
+
+}
+
+grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
+gpt_list=$(env LC_ALL=C fdisk -l | awk '/Disklabel type/ { print $3 }' | grep gpt)
+bios_grub_dev=$(env LC_ALL=C fdisk -l | awk '/BIOS boot/ { print $1 }')
+
+# Check for UEFI boot and EFI partition
+if [[ -d /sys/firmware/efi ]]; then
+	uefi_boot="yes"
+	esp_count=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }' | wc -l)
+
+	if [ -z "$gpt_list" ] ; then
+		gpt_message=$"There is no disk with a gpt partition table. 
+	You should exit this script and run gdisk to create one for uefi boot."
+	fi
+	if [ "$esp_count" -eq 1 ] ; then
+		esp_dev=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $1 }')
+		esp_dev_message=$"EFI partition found at ${esp_dev}
+	If this is not on the first hard disk, something may be wrong,
+	and you should investigate the situation."
+		if ! blkid -c /dev/null -s TYPE "$esp_dev" | grep -q "vfat" ; then
+			must_choose_esp="yes"
+			esp_dev_message=$"EFI partition found at ${esp_dev}
+	will need to be formatted FAT32"
+		fi
+	else
+		must_choose_esp="yes"
+		if [ "$esp_count" -eq 0 ] ; then
+			esp_dev_message=$" There is no EFI partition. You will need to create one."
+		elif [ "$esp_count" -gt 1 ] ; then
+			esp_dev_message=$"More than one EFI partition was detected.
+	You will need to select one. Normally, it's on the first hard disk."
+		fi
+	fi
+
+	if ! [[ "$grubversion" =~ grub-efi ]] ; then   # grub-efi-${grub_arch}*.deb to include grub-efi-ia32
+		grub_package="grub-efi*.deb"  # make sep vars for grub-x and grub-x-bin. Maybe sep. messages. Or sep. dirs?
+		grub_debs=$(ls "$grub_package_dir"/${grub_package})    # don't quote $grub_package here.
+		if [[ -n "$grub_debs" ]] ; then
+			grub_package_message=$"grub package(s) found in $grub_package_dir"
+		fi
+		grub_efi_warning=$"			### WARNING ### 
+	grub-efi is not installed. 
+
+	If you have the deb packages, you will be given a chance to install 
+	them into the new system.
+${grub_package_message}
+${grub_debs}"
+	fi
+	
+	while true ; do
+		echo $"
+	${esp_dev_message}
+	
+	${gpt_message}
+		
+	DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
+
+	1) Help 
+	2) Continue
+	3) Abort the installation
+"
+		read ans
+		case "$ans" in 
+			1) show_installer_help ; break ;;
+			2) break ;;
+			3) exit 0 ;;
+		esac
+	done
+else
+	# not uefi, do bios install.
+	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
+	if [[ -n "$esp_list" ]] ; then
+		esp_dev_message=$"EFI partition(s) found. Do not format any EFI
+ partitions if you plan to use them for uefi booting.
+ ${esp_list}"
+	fi
+	if [ -n "$gpt_list" ] && [ -z "$bios_grub_dev" ] ; then
+		gpt_message=$"To boot a gpt disk in legacy bios you must create a
+ small (>1M) unformatted partition with bios_grub flag in parted/gparted 
+ or EF02 in gdisk. Or boot from a disk that has dos partition table.
+ More info: http://www.rodsbooks.com/gdisk/bios.html"
+	fi
+
+###### grub-pc and grub-pc-bin get installed out of order
+###### Need to make $grub_package and $grub_bin_package
+###### and install them in correct order.
+	if  [[ "$grubversion" =~ grub-efi ]] || [[ -z "$grubversion" ]] ; then
+		grub_package="grub-pc*.deb"
+		grub_debs=$(ls "$grub_package_dir"/${grub_package})  # don't quote $grub_package here.
+		if [[ -n "$grub_debs" ]] ; then    
+			grub_package_message=$"grub package(s) found in $grub_package_dir"
+		fi
+		grub_efi_warning=$"		### WARNING ### 
+	grub-pc is not installed but you booted in bios mode.
+	If you have the grub-pc deb packages, you will be given a chance to
+	install them into the new system.
+${grub_package_message}
+${grub_debs}"
+	elif [[ "$grubversion" =~ "grub-pc" ]] ; then
+		grub_efi_warning=$"Boot method: bios
+	GRUB version: grub-pc (for bios boot)
+If this is not what you want, exit and examine the situation."
+
+		while true ; do
+		echo $"
+	${esp_dev_message}
+
+	${gpt_message}
+
+
+	1) Help 
+	2) Continue
+	3) Abort the installation
+"
+		read ans
+		case "$ans" in 
+			1) show_installer_help ; break ;;
+			2) break ;;
+			3) exit 0 ;;
+		esac
+	done
+	fi
+fi
+
+
+# Partition a disk
+
+list_disks () {
+	clear
+	echo
+	env LC_ALL=C fdisk -l | egrep "^Disk|^/dev"
+	sleep 5
+}
+
+partition_disk () {
+if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
+	cli_partition_tool="gdisk"
+else
+	cli_partition_tool="cfdisk"
+fi
+
+
+while true; do
+    echo $" 
+ You need to have a partition ready for the installation. If you 
+ haven't already done that, you can run the partition editor now.
+ If you want a separate /home partition, you should create it at 
+ this time, this script will ask you later if you've done that.
+ 
+ Choices (enter number):
+	1. GParted
+	2. $cli_partition_tool
+	3. No thanks, I already have a partition prepared. Continue.
+	4. I'd like to exit the script now.
+"
+	read ans
+	case $ans in
+		1) if ! [[ -f /usr/sbin/gparted ]]; then
+			while true; do
+				echo $"
+ GParted is not installed. Would you like to use $cli_partition_tool instead?
+				
+	1) Yes (use $cli_partition_tool)
+	2) No (exit the script)
+"
+				
+				read ans
+				case $ans in
+				  [1Yy]*) "$cli_partition_tool"
+						echo $"Running partprobe..."
+						partprobe
+						ask_partition
+						break ;;
+				  [2Nn]*) exit 0 ;;
+				esac
+			done
+		 elif ! [[ $DISPLAY ]]; then
+			while true; do
+				echo $"
+ GParted requires a graphical environment.
+ Would you like to use $cli_partition_tool instead?
+				
+	1) Yes (use ${cli_partition_tool})
+	2) No (exit the script)
+"
+				
+				read ans
+				case $ans in
+				  [1Yy]*) "$cli_partition_tool"
+						echo $"Running partprobe..."
+						partprobe
+						ask_partition ; break ;;
+				  [2Nn]*) exit 0 ;;
+				esac
+			done
+		 
+		 else
+			gparted
+			echo $"Running partprobe..."
+			partprobe
+			ask_partition
+		 fi
+		 break ;;
+      2) "$cli_partition_tool" 
+		echo $"Running partprobe..."
+		partprobe
+		ask_partition ; break ;;
+      3) break ;;
+      4) exit 0 ;;
+    esac
+done
+}
+
+ask_partition () {
+
+while true ; do
+	echo $"
+ Press 1 to return to partioning a disk
+ or press ENTER to proceed."
+	read ans
+	case $ans in
+	  [1Yy]) list_disks ; partition_disk ; break ;;
+	  *) break ;;
+	esac
+done
+
+}
+
+list_disks
+partition_disk
+
+ask_format_efi () {
+
+	while true ; do
+		echo $"
+ WARNING:  The selected partition does not contain a FAT32 filesystem.
+ If you just created a new efi partition (ef00), you need to format it.  
+ 
+	1) Yes, create a fat32 filesystem on $esp_dev
+	2) No, proceed without a bootloader.
+	3) Abort the install to investigate the situation.
+ 
+"
+ 
+		read ans
+		case "$ans" in
+			[1Yy]*) mkfs.vfat -F 32 "$esp_dev" ; break ;;
+			[2Nn]*) break ;;
+			[3Xx]*) exit 0 ;;
+		esac
+	done
+
+}
+
+
+choose_esp () {
+
+	esp_info=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
+	esp_dev_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $1 }')
+	esp_count=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }' | wc -l)
+	
+
+	if [ "$esp_count" -eq 0 ] ; then
+		esp_dev_message=$"There is no EFI partition. You will need to create one
+ or proceed without a bootloader."
+		echo "$esp_dev_message"
+		ask_partition
+	else
+			echo $"
+******************************************************
+
+ Enter the device name for the EFI partition to use.
+ (example: /dev/sda1)
+
+$esp_info
+
+enter device:"
+			read esp_dev
+		if ! echo "$esp_dev_list" | grep -q "$esp_dev"; then
+			echo $"Not a valid EFI partition.
+
+Press ctrl-c to exit, or press ENTER to proceed without a bootloader.
+DO NOT SELECT AN EFI PARITION FOR ANOTHER PURPOSE."
+			esp_dev=""
+		fi
+		
+		if [ -n "$esp_dev" ] ; then
+			if ! blkid -c /dev/null -s TYPE "$esp_dev" | grep -q "vfat" ; then
+				ask_format_efi
+			fi
+		fi
+	fi
+
+}
+
+# Re-check EFI partition count after partitioning.
+if [ "$esp_count" -eq 1 ] ; then
+	esp_count=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }' | wc -l)
+fi
+if [ "$esp_count" -gt 1 ] ; then
+	must_choose_esp="yes"
+fi
+
+if [[ $must_choose_esp = "yes" ]] ; then  # do if [[ $uefi_boot = "yes" ]]
+	choose_esp
+fi
+
+
+# Select location for bootloader.
+# If location is entered but does not exist, then exit with error.
+select_grub_dev () {
+	echo $"
+
+	Where would you like the GRUB bootloader to be installed?
+	(probably a drive, like /dev/sda) 
+	 
+	If you don't want to install the bootloader, leave this blank.
+"
+	read grub_dev
+	
+	if [[ -n $grub_dev ]] ; then
+	    if ! [[ -b $grub_dev ]] ; then
+			echo $"	$grub_dev is not a block device."
+			exit 1
+		fi
+	fi
+	
+	# If you enter a partition instead of a drive for grub_dev...  ##### NOT FOR NVME DISKS (or >9 partitions)
+	if [[ ${grub_dev: -1} = [1-9] ]] ; then							#### (This way should work for nvme)
+		grub_partition="$grub_dev"
+	else
+		partition_table=$(env LC_ALL=C fdisk -l "$grub_dev" | awk '/Disklabel type/ { print $3 }')
+	fi
+	if [ "$partition_table" = gpt ] && [ -z "$bios_grub_dev" ] ; then
+		bios_boot_warning="bootloader will fail without BIOS boot partition."
+		grub_dev=""
+		echo $"
+ WARNING: There is no BIOS boot partition. 
+ Press ENTER to proceed without bootloader or ctrl-c to quit.
+"
+		read -p ""
+	fi
+}
+
+if [[ $uefi_boot = "yes" ]] ;then
+	grub_dev="efi"
+	if [[ -z "$esp_dev" ]] ; then
+		grub_dev=""
+	fi
+elif [[ -z "$grub_package" ]] ; then  # grub_package is null if correct grub is installed.
+	select_grub_dev
+fi
+
+
+
+# Enter device for /boot partition or skip. If one is entered, test it.
+echo $"
+ If you created a separate partition for /boot, enter it here.
+ To skip this, just hit the ENTER key.
+ 
+ (give the full device name, like /dev/sda1): "
+ 
+read boot_dev
+echo "$boot_dev"
+if [[ -n $boot_dev ]] ; then
+	if ! [[ -b $boot_dev ]] ; then
+		echo $"
+ $boot_dev is not a block device.
+ You may continue and install without a separate boot partition,
+ or you can hit ctrl-c to exit, then re-run the script, and
+ be sure to create a partition for /boot.
+"
+		boot_dev=
+		echo $"Press ENTER to continue or ctrl-c to exit."
+		read -p " "
+	fi
+	
+	if ! [[ ${boot_dev: -1} = [0-9] ]] ; then
+	echo $"
+ $boot_dev does not end in a digit. 
+ Be sure it's a partition, not a whole drive.
+ Maybe it's a logical partition?
+"
+	echo $"Press ENTER to continue or ctrl-c to exit."
+	read -p " "
+	fi
+
+	if [[ $boot_dev = $esp_dev ]] ; then
+		echo $" EFI partition and /boot partition cannot be the same.
+ You may continue and install without a separate boot partition,
+ or you can hit ctrl-c to exit,"
+		boot_dev=
+		echo $"Press ENTER when you're ready to continue"
+		read -p " "
+	fi
+fi
+
+# Choose filesystem type for /boot if it exists.
+
+choose_fs_boot () {
+	while true; do
+		echo $"
+
+ What type of filesystem would you like on $boot_dev?
+ 
+ Choices (enter number):
+	2) ext2 (recommended for /boot)
+	3) ext3
+	4) ext4
+"
+        read ans
+        case $ans in
+          2) fs_type_boot="ext2" ; break ;;
+          3) fs_type_boot="ext3" ; break ;;
+          4) fs_type_boot="ext4" ; break ;;
+        esac
+    done
+
+}
+
+if [[ -n $boot_dev ]]; then
+	if [[ $no_format = "yes" ]]; then 
+		fs_type_boot=$(blkid -s TYPE "$boot_dev" | awk -F"\"" '{ print $2 }')
+	else
+		choose_fs_boot
+	fi
+fi
+
+
+# Choose partition for root filesystem
+echo $"
+
+ Which partition would you like to use for the installation
+ of the operating system?
+ 
+ (give the full device name, like /dev/sda1): "
+read install_dev
+if ! [[ -b $install_dev ]] ; then
+	echo $"	$install_dev is not a block device! "
+	exit 1
+fi
+
+if ! [[ ${install_dev: -1} = [0-9] ]] ; then
+	echo $"
+ $install_dev does not end in a digit. 
+ Be sure it's a partition, not a whole drive.
+ Maybe it's a logical partition?
+"
+	echo $"Press ENTER to continue or ctrl-c to exit."
+	read -p " "
+
+fi
+
+# Choose filesystem type for OS.
+choose_fs_os () {
+
+	while true; do
+	 echo $"
+   
+ What type of filesystem would you like on $install_dev?
+ 
+ Choices (enter number):
+	2) ext2
+	3) ext3
+	4) ext4
+	5) btrfs (single partition)
+	6) btrfs (with subvolumes)
+"
+	    read ans
+	    case $ans in
+	      2) fs_type_os="ext2" ; break ;;
+	      3) fs_type_os="ext3" ; break ;;
+	      4) fs_type_os="ext4" ; break ;;
+	      5) fs_type_os="btrfs" ; btrfs_mode="single" ; break ;;
+	      6) fs_type_os="btrfs" ; btrfs_mode="subvol" ; break ;;
+	    esac
+	done
+	
+	
+	
+	# Decide if OS should be encrypted
+	while true; do
+		echo $"
+
+ Do you want the operating system on an encrypted partition?
+	1) yes
+	2) no
+"
+		read ans
+		case $ans in
+			[1Yy]*) encrypt_os="yes"
+				# test for cryptsetup
+				if ! [[ -f /sbin/cryptsetup ]]; then
+					while true; do
+						echo $" Cryptsetup is not installed. You need to
+ install it and run the command, 'sudo modprobe dm-mod'
+ before you can use encryption.Do you want to proceed
+ without encrypting the partition?
+ 
+	1) Yes, proceed without encrypting the partition
+	2) No.  Exit
+"
+						read ans
+						case $ans in
+							[1Yy]*) encrypt_os="no" ; break 2 ;;
+							[2Nn]*) exit 1 ;;
+						esac
+					done
+				fi
+				# end test for cryptsetup
+				# test to see if there's a separate /boot partition
+				if [[ -z $boot_dev ]] ; then
+					while true; do
+						echo $"
+ Your /boot directory will be part of the encrypted filesystem.
+ luks1 format will be used for this partition.
+ You can proceed, go back to partitioning, or you can exit and start over.
+
+	1) Continue
+	2) Return to partitioning
+	3) Exit
+"
+						read ans
+						case $ans in
+							[1Yy]*) encrypt_boot="yes" ; break ;;
+							[2]) partition_disk ;;
+							[3Nn]*) exit 1 ;;
+						esac
+					done
+				fi
+				# end test for separate /boot partition
+				break ;;
+			[2Nn]*) encrypt_os="no"  ; break ;;
+		esac
+	done
+
+}
+
+
+btrfs_mode=""
+if [[ $no_format = "yes" ]]; then
+	fs_type_os=$(blkid -s TYPE "$install_dev" | awk -F"\"" '{ print $2 }')
+	if [[ "$fs_type_os" == "btrfs" ]]; then
+		# Learn the layout from the disk (manifest if present, else discover).
+		if load_btrfs_layout "$install_dev"; then
+			btrfs_mode="subvol"
+			echo -e $"\n Detected btrfs subvolume layout (source: $btrfs_layout_source):"
+			for _i in "${!btrfs_subvols[@]}"; do
+				printf '   %-18s -> %s\n' "${btrfs_subvols[$_i]}" "${btrfs_subvol_mounts[$_i]}"
+			done
+			echo ""
+		else
+			btrfs_mode="single"
+		fi
+	fi
+else
+	choose_fs_os
+fi
+
+# Check for btrfs-progs if btrfs was selected
+if [[ "$fs_type_os" == "btrfs" ]]; then
+	if ! command -v mkfs.btrfs &>/dev/null; then
+		echo $"
+ btrfs-progs is not installed. Install it with:
+ apt-get install btrfs-progs
+ Then run the installer again.
+"
+		exit 1
+	fi
+fi
+
+
+# Enter device for /home partition or skip. If one is entered, test it.
+echo $"
+
+ If you created a separate partition for /home, 
+ enter the full device name. However, if you're 
+ installing everything to one partition, you should
+ leave this blank.
+
+ /home partition (if one exists): "
+read home_dev
+if [[ -n $home_dev ]] ; then
+	if ! [[ -b $home_dev ]] ; then
+		echo $"
+ $home_dev is not a block device.
+ You may continue and install without a separate home partition,
+ or you can hit ctrl-c to exit, then re-run the script, and
+ be sure to create a partition for /home.
+"
+		home_dev=
+		echo $"Press ENTER to continue or ctrl-c to exit."
+		read -p " "
+	fi
+	
+	if ! [[ ${home_dev: -1} = [0-9] ]] ; then
+	echo $"
+ $home_dev does not end in a digit. 
+ Be sure it's a partition, not a whole drive.
+ Maybe it's a logical partition?
+"
+	echo $"Press ENTER to continue or ctrl-c to exit."
+	read -p " "
+	fi
+
+	if [[ $home_dev = $esp_dev ]] ; then
+		echo $" EFI partition and /home partition cannot be the same.
+ You may continue and install without a separate home partition,
+ or you can hit ctrl-c to exit,"
+		home_dev=
+		echo $"Press ENTER when you're ready to continue"
+		read -p " "
+	fi
+fi
+
+# Choose filesystem type for /home if needed
+choose_fs_home () {
+	while true; do
+		echo $"
+        
+ What type of filesystem would you like on $home_dev?
+ 
+ Choices (enter number):
+	2) ext2
+	3) ext3
+	4) ext4
+"
+		read ans
+		case $ans in
+			2) fs_type_home="ext2" ; break ;;
+			3) fs_type_home="ext3" ; break ;;
+			4) fs_type_home="ext4" ; break ;;
+		esac
+	done
+
+
+# Decide if /home should be encrypted
+	while true; do
+		echo $"
+        
+ Do you want /home on an encrypted partition?
+ 1) Yes
+ 2) No
+"
+	read ans
+	case $ans in
+		[1Yy]*) encrypt_home="yes"
+			# test for cryptsetup
+			if ! [[ -f /sbin/cryptsetup ]]; then
+				while true; do
+					echo $" Cryptsetup is not installed. You need to
+ install it and run the command, 'sudo modprobe dm-mod'
+ before you can use encryption. Do you want to proceed
+ without encrypting the partition?
+ 
+	1) Yes, proceed without encrypting the partition.
+	2) No. Exit
+"
+					read ans
+					case $ans in
+						[1Yy]*) encrypt_home="no" ; break 2 ;;
+						[2Nn]*) exit 1 ;;
+					esac
+				done
+			fi
+			# end test for cryptsetup
+			break ;;
+		[2Nn]*) encrypt_home="no"  ; break ;;
+	esac
+	done
+
+}
+
+if [[ -n $home_dev ]]; then
+	if [[ $no_format = "yes" ]]; then 
+		fs_type_home=$(blkid -s TYPE "$home_dev" | awk -F"\"" '{ print $2 }')
+	else
+		choose_fs_home
+	fi
+fi
+
+
+# Show available swap partitions and choose one.
+choose_swap () {
+
+	echo $"
+ List of swap partitions available
+ $swap_info
+
+ Enter the swap device to use. If you don't enter a device name,
+ a swapfile will be used instead.
+"
+	read swap_dev
+	if ! [ -b "$swap_dev" ] ; then
+		use_existing_swap="no"
+	fi
+
+}
+
+swap_info=$(/sbin/blkid | awk '/TYPE="swap"/ {print "\n" $0 }')
+swap_device_list=$(/sbin/blkid -s TYPE | awk -F: '/swap/ {print "\n" $1 }')
+
+if [[ -n "$swap_device_list" ]] ; then
+	use_existing_swap="yes"
+	choose_swap
+fi
+
+
+# Use UUID in fstab? (and test for encrypted OS or home)
+while true; do
+	echo $"
+ Would you like fstab to use the UUID to identify filesystems?
+ This is useful if your drive order changes between reboots.
+   Press ENTER for YES.
+   Press 2 for no.
+"
+ 	read ans
+	case $ans in
+		[2Nn]*)	break ;;
+		*) 	use_uuid="yes"
+			if [[ $encrypt_os = "yes" ]] || [[ $encrypt_home = "yes" ]]; then
+				uuid_message=$"-->	UUIDs will be used in crypttab
+		/dev/mapper/<name> will be used in fstab."
+			fi
+			break ;;
+	esac
+done
+
+
+# Enter new hostname (or use the old hostname as the new one)
+# Test to make sure it's a legal hostname, and let user fix it
+# if it's not.
+fix_hostname () {
+while true; do
+	echo $"
+ Illegal hostname. Try again.
+	
+ You can use alphanumeric characters anywhere in the hostname, and 
+ you can use the minus sign (-) as long as it's not at the beginning 
+ or end.
+
+New hostname: "
+
+	read new_hostname
+	break
+done
+	test_hostname	
+}
+
+test_hostname () {
+  if [[ -z $new_hostname ]]; then
+    new_hostname="$HOSTNAME"
+  fi
+	if [[ ! "$new_hostname" =~ (^[a-zA-Z0-9]([a-zA-Z0-9]|-)+[a-zA-Z0-9]$) ]]; then
+		fix_hostname
+	fi
+  hostname_len=${#new_hostname}
+  if [[ $hostname_len -gt 63 ]]; then
+    fix_hostname
+  fi
+}
+
+
+select_hostname () {
+while true; do
+	echo $"
+ The current hostname is ${HOSTNAME}. To change that, enter the new
+ hostname here. To leave it unchanged, just press ENTER.
+
+New hostname: "
+
+	read new_hostname
+	break
+done
+	test_hostname
+}
+
+# Change hostname if desired
+select_hostname
+
+# In case null was entered above as hostname, then set it to $HOSTNAME
+new_hostname=${new_hostname:="$HOSTNAME"}
+
+# Show a summary of what will be done
+
+if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
+	grub_dev_message=$"--> You will be asked about a bootloader later."
+elif [[ -n $grub_dev ]] ; then
+    grub_dev_message=$"--> Bootloader will be installed in $grub_dev"
+elif [[ -n $grub_partition ]] ; then
+	grub_dev_message=$"--> Bootloader will be installed in $grub_partition"
+else
+    grub_dev_message=$"--> Bootloader will not be installed."
+fi
+
+if [[ $encrypt_os = yes ]] ; then
+	os_enc_message=$", and will be encrypted."
+fi
+
+if [[ -z $home_dev ]] ; then
+	home_dev_message=$"--> /home will not be on a separate partition."
+elif [[ $no_format = "yes" ]] ; then
+	home_dev_message=$"--> /home will be installed on $home_dev without formatting it."
+else
+	home_dev_message=$"--> /home will be installed on $home_dev and formatted as $fs_type_home"
+fi
+
+if [[ -n $home_dev ]] && [[ $encrypt_home = yes ]] ; then
+	home_enc_message=$", and will be encrypted."
+fi
+
+if [[ -n $boot_dev ]] ; then
+	if [[ $no_format != "yes" ]]; then
+		boot_dev_message=$"--> /boot will be installed on $boot_dev and formatted as $fs_type_boot."
+	else
+		boot_dev_message=$"--> /boot will be installed on $boot_dev"
+	fi
+fi
+
+if [[ $no_format = "yes" ]]; then
+	install_dev_message=$"--> Operating system will be installed on $install_dev without formatting it."
+else
+	install_dev_message=$"--> Operating system will be installed on $install_dev and formatted as $fs_type_os"
+fi
+
+while true; do
+	echo $"  
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                SUMMARY OF WHAT WILL BE DONE
+    
+ $grub_dev_message
+ $install_dev_message$os_enc_message
+ $home_dev_message$home_enc_message
+ $boot_dev_message
+ $uuid_message
+ Hostname: $new_hostname
+   
+ WARNING: This is your last chance to exit before any changes are made.
+ 
+ Proceed with the installation?  
+   1) Yes
+   2) No, abort the installation.
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+"
+	read ans
+	case $ans in
+		[1Yy]*) break ;;
+		[2Nn]*) exit 0 ;;
+	esac
+done
+
+# Actual installation begins here
+
+# Unmount or close anything that might need unmounting or closing
+cleanup () {
+echo -e $"\n Cleaning up...\n"
+if $(df | grep -q /target/proc/) ; then
+	umount /target/proc/
+fi
+
+if $(df | grep -q /target/dev/) ; then
+	umount /target/dev/
+fi
+
+if $(df | grep -q /target/sys/) ; then
+	umount /target/sys/
+fi
+
+if $(df | grep -q /target_boot/efi) ; then
+    umount -l /target_boot/efi
+fi
+
+if $(df | grep -q /target_boot) ; then
+	umount -l /target_boot/
+fi
+
+if $(df | grep -q /target_home) ; then
+	umount -l /target_home/
+fi
+
+if $(df | grep -q /target) ; then
+	umount -l /target/
+fi
+
+if $(df | grep -q $install_dev) ; then
+	umount $install_dev
+fi    
+
+if $(df | grep "\/dev\/mapper\/root_fs") ; then
+	umount /dev/mapper/root_fs
+fi
+
+if [[ -h /dev/mapper/root_fs ]] ; then
+	cryptsetup luksClose /dev/mapper/root_fs
+fi
+
+if $(df | grep -q $home_dev) ; then
+	umount $home_dev
+fi
+
+if $(df | grep -q "\/dev\/mapper\/home_fs") ; then
+	umount /dev/mapper/home_fs
+fi
+
+if [[ -h /dev/mapper/home_fs ]] ; then
+	cryptsetup luksClose home_fs
+fi
+
+if $(df | grep -q $boot_dev) ; then
+	umount -l $boot_dev
+fi
+# These next ones might be unnecessary
+if [[ -d /target ]] ; then
+	rm -rf /target
+fi
+
+if [[ -d /target_home ]] ; then
+	rm -rf /target_home
+fi
+
+if [[ -d /target_boot ]] ; then
+	rm -rf /target_boot
+fi
+}
+
+cleanup
+
+# make mount point, format, adjust reserve and mount
+# install_dev must maintain the device name for cryptsetup
+# install_part will be either device name or /dev/mapper name as needed.
+echo -e $"\n Preparing $install_dev...\n"
+mkdir /target ;  check_exit
+if [[ $encrypt_os = yes ]] ; then
+    echo $" You will need to create a passphrase."
+    if [[ $encrypt_boot = "yes" ]] ; then
+        cryptsetup luksFormat --type luks1 "$install_dev" ; check_exit
+    else
+        cryptsetup luksFormat "$install_dev" ; check_exit
+    fi
+    echo $"Encrypted partition created. Opening it..."
+    cryptsetup luksOpen "$install_dev" root_fs ; check_exit
+    install_part="/dev/mapper/root_fs"
+else
+    install_part="$install_dev"
+fi
+
+if [[ $no_format != "yes" ]]; then
+	if [[ "$fs_type_os" == "btrfs" ]]; then
+		mkfs.btrfs --force "$install_part" # ; check_exit 
+	else
+		mke2fs -t $fs_type_os "$install_part" # ; check_exit 
+	fi
+
+# For btrfs with subvolumes, create subvolumes (only when formatting) and
+# record the layout in a manifest so the installer can re-learn it later.
+	if [[ "$btrfs_mode" == "subvol" ]]; then
+		_btrfs_top=$(mktemp -d)
+		mount -o subvolid=5 "$install_part" "$_btrfs_top"
+		for _sv in "${btrfs_subvols[@]}"; do
+			btrfs subvolume create "$_btrfs_top/$_sv"
+		done
+		{
+			echo "# Refracta btrfs subvolume layout"
+			echo "# <subvolume><TAB><mountpoint> — created by refractainstaller"
+			for _idx in "${!btrfs_subvols[@]}"; do
+				printf '%s\t%s\n' "${btrfs_subvols[$_idx]}" "${btrfs_subvol_mounts[$_idx]}"
+			done
+		} > "$_btrfs_top/$btrfs_layout_manifest"
+		umount "$_btrfs_top"; rmdir "$_btrfs_top"
+	fi
+fi
+
+# Mount root partition (or the subvolume mapped to "/")
+if [[ "$btrfs_mode" == "subvol" ]]; then
+	mount -o subvol="$btrfs_root_subvol" "$install_part" /target ; check_exit
+else
+	mount "$install_part" /target ; check_exit
+fi
+
+# Mount btrfs subvolumes for /home, /var, /tmp, /.snapshots
+if [[ "$btrfs_mode" == "subvol" ]]; then
+	for _idx in "${!btrfs_subvols[@]}"; do
+		_sv="${btrfs_subvols[$_idx]}"
+		_mp="${btrfs_subvol_mounts[$_idx]}"
+		[[ "$_mp" == "/" ]] && continue
+		mkdir -p "/target$_mp"
+		mount -o subvol="$_sv" "$install_part" "/target$_mp" ; check_exit
+	done
+fi
+
+# make mount point for separate home if needed
+# and add /home/* to the excludes list if it's not already there
+if [[ -n $home_dev ]] ; then
+	echo $"
+ Preparing $home_dev...
+"
+	mkdir /target_home ; check_exit
+	if [[ $encrypt_home = yes ]]; then
+		echo $"
+ You will need to create a passphrase.
+"
+		cryptsetup luksFormat "$home_dev"
+		check_exit
+		echo $"Encrypted partition created. Opening it..."
+		cryptsetup luksOpen "$home_dev" home_fs
+		check_exit
+		home_part="/dev/mapper/home_fs"
+	else
+		home_part=$home_dev
+	fi
+	if [[ $no_format != "yes" ]]; then
+		mke2fs -t $fs_type_home "$home_part" # ; check_exit
+#		tune2fs -r 10000 "$home_part" ; check_exit
+	fi
+	mount "$home_part" /target_home ; check_exit
+	sep_home_opt="--exclude=/home/*"
+fi
+
+# make mount point for separate /boot if needed
+# and add /boot/* to the excludes list if it's not already there
+# allow default for reserved blocks (don't need tune2fs here)
+if [[ -n $boot_dev ]] ; then
+	mkdir /target_boot ; check_exit
+	if [[ $no_format != "yes" ]]; then
+		mke2fs -t $fs_type_boot $boot_dev # ; check_exit
+	fi
+	mount $boot_dev /target_boot
+	sep_boot_opt="--exclude=/boot/*"
+fi
+
+
+# copy everything over except the things listed in the exclude list
+echo -e $"\n Copying system to new partition...\n"
+rsync -av / /target/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$rsync_excludes" ${sep_home_opt} ${sep_boot_opt} 
+
+# copy separate /home if needed
+if [[ -n $home_part ]] ; then
+	echo -e $"\n Copying home folders to new partition...\n"
+	rsync -av /home/ /target_home/  --filter='P lost+found' --filter='H lost+found' --exclude-from="$home_boot_excludes"
+fi
+
+# copy separate /boot if needed
+if [[ -n $boot_dev ]] ; then
+	echo -e $"\n Copying files to boot partitions...\n"
+	rsync -av /boot/ /target_boot/  --filter='P lost+found' --filter='H lost+found' --exclude-from="$home_boot_excludes"
+fi
+
+#*************************************************************
+
+# make some basic entries in /dev so the system can boot properly before udev starts
+
+mknod -m 622 /target/dev/console c 5 1
+mknod -m 666 /target/dev/null c 1 3
+mknod -m 666 /target/dev/zero c 1 5
+mknod -m 666 /target/dev/ptmx c 5 2
+mknod -m 666 /target/dev/tty c 5 0
+mknod -m 444 /target/dev/random c 1 8
+mknod -m 444 /target/dev/urandom c 1 9
+chown -v root:tty /target/dev/{console,ptmx,tty}
+
+ln -sv /proc/self/fd /target/dev/fd
+ln -sv /proc/self/fd/0 /target/dev/stdin
+ln -sv /proc/self/fd/1 /target/dev/stdout
+ln -sv /proc/self/fd/2 /target/dev/stderr
+ln -sv /proc/kcore /target/dev/core
+ln -sv /run/shm /target/dev/shm
+mkdir -v /target/dev/pts
+
+
+# Set up dual logging — real-time mirror of error log to the target disk
+# so that both the live system and the installed system have identical logs
+_target_error_log="/target/var/log/refractainstaller.log"
+if [[ -d /target/var/log ]]; then
+	tail -n +1 -F "$error_log" > "$_target_error_log" 2>/dev/null &
+	_log_tail_pid=$!
+fi
+
+
+#*************************************************************
+
+# create swap
+if ! [[ $use_existing_swap = "yes" ]] ; then
+	echo -e $"\n Making a swap file...\n"
+	# Default swapfile location (non-btrfs and plain btrfs).
+	swapfile_fstab="/swapfile"
+	swapfile_target="/target/swapfile"
+	# On btrfs, if the layout has a dedicated @swap subvolume, put the swapfile
+	# there (kept out of root snapshots).
+	if [[ "$fs_type_os" == "btrfs" && "$btrfs_mode" == "subvol" ]]; then
+		for _idx in "${!btrfs_subvols[@]}"; do
+			if [[ "${btrfs_subvols[$_idx]}" == "@swap" ]]; then
+				swapfile_fstab="${btrfs_subvol_mounts[$_idx]}/swapfile"
+				swapfile_target="/target${btrfs_subvol_mounts[$_idx]}/swapfile"
+				break
+			fi
+		done
+	fi
+	mkdir -p "$(dirname "$swapfile_target")"
+	# A btrfs swapfile MUST be NoCoW or swapon fails ("swapfile has holes").
+	# chattr +C only takes effect on an empty file, so set it before writing.
+	# (Only btrfs needs this; other filesystems don't.)
+	if [[ "$fs_type_os" == "btrfs" ]]; then
+		rm -f "$swapfile_target"
+		truncate -s 0 "$swapfile_target"
+		chattr +C "$swapfile_target" 2>/dev/null
+	fi
+	# Size the swapfile to match the target's RAM (rounded up to a whole GiB) so
+	# it is large enough for hibernation. Applies to EVERY filesystem; the stock
+	# 256 MiB default rounds to 0 GiB in `free -g` and is useless on a desktop.
+	# Falls back to the configured size if RAM can't be read.
+	swap_bs="$swapfile_blocksize"
+	swap_count="$swapfile_count"
+	_mem_mib=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
+	if [[ -n "$_mem_mib" && "$_mem_mib" -ge 1 ]]; then
+		swap_bs="1M"
+		swap_count=$(( ( (_mem_mib + 1023) / 1024 ) * 1024 ))
+		echo -e $"\n Sizing swapfile to ${swap_count} MiB to match RAM (${_mem_mib} MiB)...\n"
+	fi
+	dd if=/dev/zero of="$swapfile_target" bs="$swap_bs" count="$swap_count" ; check_exit
+	chmod 600 "$swapfile_target"
+	mkswap "$swapfile_target" ; check_exit
+	# Hibernation (v7): the image lives in this swapfile, on the root filesystem
+	# ($install_dev). Record the resume device UUID + the swapfile's offset.
+	# Skipped for encrypted root (resuming from encrypted swap needs more setup).
+	if [[ "$encrypt_os" != "yes" ]]; then
+		if [[ "$fs_type_os" == "btrfs" ]]; then
+			resume_offset=$(btrfs inspect-internal map-swapfile -r "$swapfile_target" 2>/dev/null)
+		else
+			resume_offset=$(filefrag -v "$swapfile_target" 2>/dev/null | awk '$1=="0:"{o=$4; sub(/\.\./,"",o); print o; exit}')
+		fi
+		# Only enable resume if we actually obtained the swapfile's offset.
+		[[ -n "$resume_offset" ]] && resume_uuid=$(blkid -s UUID -o value "$install_dev" 2>/dev/null)
+	fi
+fi
+
+# Disallow mounting of all fixed drives with pmount
+if [[ -f /target/etc/pmount.allow ]] ; then
+	if [[ $pmount_fixed = "no" ]] ; then
+		sed -i 's:/dev/sd\[a-z\]:#/dev/sd\[a-z\]:' /target/etc/pmount.allow
+	fi
+fi
+
+# Re-enable updatedb if it was disabled by an older version of refractasnapshot
+if [[ -e /target/usr/bin/updatedb.mlocate ]] ; then
+	if ! [[ -x /target/usr/bin/updatedb.mlocate ]] ; then
+		chmod +x /target/usr/bin/updatedb.mlocate
+	fi
+fi
+
+# Disable auto-login
+
+while true; do
+	echo -e $" \n\nDisable auto-login?
+	Press ENTER for YES.
+	Press 2 for no.
+"
+	read ans
+	case $ans in
+	[2Nn]*) 	break ;;
+	*)
+ 		disable_auto_desktop="yes"
+			break ;;
+	esac
+done
+
+
+# Disable autologin
+set_noautologin_desktop () {
+
+	#gdm
+	if [[ -f /target/etc/gdm/gdm.conf ]]; then
+		sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm/gdm.conf
+	fi
+
+	#gdm3
+	if [[ -f /target/etc/gdm3/daemon.conf ]]; then
+		sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
+	fi
+
+	#lightdm
+	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
+		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
+	fi
+
+	#kdm
+	if [ -f /target/etc/default/kdm.d/live-autologin ]; then
+		rm -f /target/etc/default/kdm.d/live-autologin
+	fi
+
+	if [ -f /target/etc/kde3/kdm/kdmrc ]; then
+		sed -i -e 's/^AutoLogin/#AutoLogin/g' /target/etc/kde3/kdm/kdmrc \
+			-e 's/^AutoReLogin/#AutoReLogin/g' /target/etc/kde3/kdm/kdmrc
+	fi
+
+	if [ -f /target/etc/kde4/kdm/kdmrc ]; then
+		sed -i -e 's/^AutoLogin/#AutoLogin/g' /target/etc/kde4/kdm/kdmrc \
+			-e 's/^AutoReLogin/#AutoReLogin/g' /target/etc/kde4/kdm/kdmrc
+	fi
+
+	# trinity desktop
+
+	# v3.5.13
+	if [[ -f /target/etc/default/kdm-trinity.d/live-autologin ]]; then
+		rm -f  /target/etc/default/kdm-trinity.d/live-autologin
+	fi
+
+	if [ -f /target/etc/trinity/kdm/kdmrc ]; then
+		sed -i -e 's/^AutoLogin/#AutoLogin/g' /target/etc/trinity/kdm/kdmrc \
+			-e 's/^AutoReLogin/#AutoReLogin/g' /target/etc/trinity/kdm/kdmrc
+	fi
+
+	# v3.5.14
+	if [[ -f /target/etc/default/tdm-trinity.d/live-autologin ]]; then
+		rm -f  /target/etc/default/tdm-trinity.d/live-autologin
+	fi
+
+	if [ -f /target/etc/trinity/tdm/tdmrc ]; then
+		sed -i -e 's/^AutoLogin/#AutoLogin/g' /target/etc/trinity/tdm/tdmrc \
+			-e 's/^AutoReLogin/#AutoReLogin/g' /target/etc/trinity/tdm/tdmrc
+	fi
+
+	#slim
+	if [[ -f /target/etc/slim.conf ]] ; then
+		sed -i -e 's/^[ ]*default_user/#default_user/' \
+			-e 's/^[ ]*auto_login.*$/#auto_login no/' /target/etc/slim.conf
+	fi
+
+	# lxdm
+	if [[ -f /target/etc/lxdm/lxdm.conf ]] ; then
+		sed -i -e 's/^autologin=/#autologin=/' /target/etc/lxdm/lxdm.conf
+	fi
+
+	# No display manager
+	if [ -f /target/etc/profile.d/zz-live-config_xinit.sh ]; then
+		rm -f /target/etc/profile.d/zz-live-config_xinit.sh
+	fi
+
+}
+
+
+# Keep autologin and update username in the display manager config.
+set_autologin_desktop () {
+
+	#gdm
+    if [[ -f /target/etc/gdm/gdm.conf ]]; then
+        sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm/gdm.conf
+    fi
+
+	#gdm3
+    if [[ -f /target/etc/gdm3/daemon.conf ]]; then
+        sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
+    fi
+
+	#lightdm
+	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
+		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
+	fi
+
+	#kdm
+	if [ -f /target/etc/default/kdm.d/live-autologin ]; then
+		# This one might not be right.
+		sed -i "s/$oldusername/$newusername/g" /target/etc/default/kdm.d/live-autologin
+	fi
+
+	if [ -f /target/etc/kde3/kdm/kdmrc ]; then
+		sed -i -e "/AutoLogin/s/$oldusername/$newusername/" /target/etc/kde3/kdm/kdmrc \
+			-e "/AutoReLogin/s/$oldusername/$newusername/" /target/etc/kde3/kdm/kdmrc
+	fi
+
+	if [ -f /target/etc/kde4/kdm/kdmrc ]; then
+		sed -i -e "/AutoLogin/s/$oldusername/$newusername/" /target/etc/kde4/kdm/kdmrc \
+			-e "/AutoReLogin/s/$oldusername/$newusername/" /target/etc/kde4/kdm/kdmrc
+	fi
+
+	# trinity desktop
+	
+	# v3.5.13
+	if [[ -f /target/etc/default/kdm-trinity.d/live-autologin ]]; then
+		# This one might not be right.
+		sed -i "s/$oldusername/$newusername/g" /target/etc/default/kdm-trinity.d/live-autologin
+	fi
+	
+	if [ -f /target/etc/trinity/kdm/kdmrc ]; then
+		sed -i -e "/AutoLogin/s/$oldusername/$newusername/" /target/etc/trinity/kdm/kdmrc \
+			-e "/AutoReLogin/s/$oldusername/$newusername/" /target/etc/trinity/kdm/kdmrc	
+	fi
+
+	# v3.5.14
+	if [[ -f /target/etc/default/tdm-trinity.d/live-autologin ]]; then
+		# This one might not be right.
+		sed -i "s/$oldusername/$newusername/g" /target/etc/default/tdm-trinity.d/live-autologin		
+	fi
+	
+	if [ -f /target/etc/trinity/tdm/tdmrc ]; then
+		sed -i -e "/AutoLogin/s/$oldusername/$newusername/" /target/etc/trinity/tdm/tdmrc \
+			-e "/AutoReLogin/s/$oldusername/$newusername/" /target/etc/trinity/tdm/tdmrc		
+	fi
+
+	#slim
+	if [[ -f /target/etc/slim.conf ]] ; then
+		sed -i  -e "/default_user/s/\s\+$oldusername/ $newusername/" /target/etc/slim.conf
+	fi
+
+	# lxdm
+	if [[ -f /target/etc/lxdm/lxdm.conf ]] ; then
+		sed -i -e "/^autologin=/s/$oldusername/$newusername/" /target/etc/lxdm/lxdm.conf
+	fi
+
+	# No display manager
+    # (Nothing to do here.)
+    
+}
+
+
+
+# Change hostname
+if ! [[ $new_hostname = "$HOSTNAME" ]]; then
+	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
+	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
+fi
+
+# setup fstab    ### TEST FOR UUID AND ENCRYPTION HAPPENS ABOVE THIS!!!
+
+# add entry for root filesystem
+if [[ $encrypt_os != "yes" ]]; then
+	if [[ $use_uuid = yes ]]; then
+		install_part="$(blkid -s UUID $install_dev | awk '{ print $2 }' | sed 's/\"//g')"
+	fi
+fi
+echo -e $"\n Creating /etc/fstab...\n"
+if [[ "$btrfs_mode" == "subvol" ]]; then
+	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime,subvol=$btrfs_root_subvol\t0\t1" >> /target/etc/fstab
+else
+	echo -e "$install_part\t/\t$fs_type_os\tdefaults,noatime\t0\t1" >> /target/etc/fstab
+fi
+check_exit
+
+# Add btrfs subvolume entries to fstab
+if [[ "$btrfs_mode" == "subvol" ]]; then
+	for _idx in "${!btrfs_subvols[@]}"; do
+		_sv="${btrfs_subvols[$_idx]}"
+		_mp="${btrfs_subvol_mounts[$_idx]}"
+		[[ "$_mp" == "/" ]] && continue
+		echo -e "$install_part\t$_mp\t$fs_type_os\tdefaults,noatime,subvol=$_sv\t0\t2" >> /target/etc/fstab
+	done
+fi
+
+
+# add entry for /home to fstab if needed
+if [[ -n $home_part ]] ; then
+	if [[ $encrypt_home != "yes" ]]; then
+		if [[ $use_uuid = yes ]]; then
+			home_part="$(blkid -s UUID $home_dev | awk '{ print $2 }' | sed 's/\"//g')"
+		fi
+	fi
+    echo -e $"\n Adding /home entry to fstab...\n"
+    echo -e "$home_part\t/home\t$fs_type_home\tdefaults,noatime\t0\t2" >> /target/etc/fstab
+    check_exit
+fi
+
+# add entry for /boot to fstab if needed
+if [[ -n $boot_dev ]] ; then
+	if [[ $use_uuid = yes ]]; then
+		boot_part="$(blkid -s UUID $boot_dev | awk '{ print $2 }' | sed 's/\"//g')"
+	else
+		boot_part="$boot_dev"
+	fi
+	echo -e $"\n Adding /boot entry to fstab...\n"
+	echo -e "$boot_part\t/boot\t$fs_type_boot\tdefaults,noatime\t0\t1" >> /target/etc/fstab
+	check_exit
+fi
+
+
+# add entry for swap to fstab if needed
+if [[ $use_existing_swap = "yes" ]] ; then
+	if [[ $use_uuid = yes ]]; then
+		swap_part="$(/sbin/blkid -s UUID $swap_dev | awk '{ print $2 }' | sed 's/\"//g')"
+	else
+		swap_part="$swap_dev"
+	fi
+	# Hibernation (v7): resume from this swap partition (no offset needed).
+	resume_uuid=$(/sbin/blkid -s UUID -o value "$swap_dev" 2>/dev/null)
+	echo -e $"\n Adding swap entry to fstab...\n"
+	echo -e "$swap_part\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
+else
+	echo -e "${swapfile_fstab:-/swapfile}\tnone\tswap\tsw\t0\t0" >> /target/etc/fstab
+fi
+
+
+# Add entry for root filesystem to crypttab if needed
+if [[ $encrypt_os = yes ]] ; then
+	echo -e $"\n Adding $install_part entry to crypttab...\n"
+	if [[ $use_uuid = yes ]]; then
+		install_crypt="$(blkid -s UUID $install_dev | awk '{ print $2 }' | sed 's/\"//g')"
+		echo -e "root_fs\t\t$install_crypt\t\tnone\t\tluks" >> /target/etc/crypttab
+	else
+		echo -e "root_fs\t\t$install_dev\t\tnone\t\tluks" >> /target/etc/crypttab
+	fi
+fi
+
+# Add entry for /home to crypttab if needed
+if [[ $encrypt_home = yes ]] ; then
+	echo -e $"\n Adding $home_part entry to crypttab...\n"
+	if [[ $use_uuid = yes ]]; then
+		home_crypt="$(blkid -s UUID $home_dev | awk '{ print $2 }' | sed 's/\"//g')"
+		echo -e "home_fs\t\t$home_crypt\t\tnone\t\tluks" >> /target/etc/crypttab
+	else
+		echo -e "home_fs\t\t$home_dev\t\tnone\t\tluks" >> /target/etc/crypttab
+	fi
+fi
+
+#####  May need to check for /etc/default/grub and warn if absent ##########
+# Tell grub to use encrypted /boot directory.
+if [[ $encrypt_boot = yes ]] ; then
+	if ! [[ $(grep ^GRUB_ENABLE_CRYPTODISK /target/etc/default/grub) ]] ; then
+		echo -e "\nGRUB_ENABLE_CRYPTODISK=y\n" >> /target/etc/default/grub
+	fi
+	if ! [[ $(grep 'UMASK=0077' /etc/initramfs-tools/conf.d/initramfs-permissions) ]] ; then
+		echo -e '\nUMASK=0077\n' > /etc/initramfs-tools/conf.d/initramfs-permissions
+	fi
+fi
+
+# Allow users to login to ssh with passwords if desired.
+# Allow root login only with auth keys.
+# or do nothing.
+if [[ $ssh_pass = "yes" ]] ; then
+	sed -i~ 's/PasswordAuthentication no/PasswordAuthentication yes/' /target/etc/ssh/sshd_config
+	sed -i 's/PermitRootLogin yes/PermitRootLogin prohibit-password/' /target/etc/ssh/sshd_config
+elif [[ $ssh_pass = "no" ]] ; then
+	sed -i~ 's/.*PasswordAuthentication yes/PasswordAuthentication no/' /target/etc/ssh/sshd_config
+	sed -i 's/PermitRootLogin yes/PermitRootLogin prohibit-password/' /target/etc/ssh/sshd_config
+elif [[ -n "$ssh_pass" ]] ; then	
+	echo $"WARNING: ssh_pass value not recognized. No changes were made to /etc/ssh/sshd_config"
+fi
+
+
+
+# mount stuff so grub will behave (so chroot will work)
+echo -e $"\n Mounting tmpfs and proc...\n"
+mount --bind /dev/ /target/dev/ ; check_exit 
+mount --bind /proc/ /target/proc/ ; check_exit 
+mount --bind /sys/ /target/sys/ ; check_exit 
+
+# If /boot is separate partition, mount it in the chroot for grub — but only if
+# it isn't already mounted. With EFI + a separate /boot, the ESP-setup phase
+# already mounts $boot_dev at /target/boot (with the ESP under it at
+# /target/boot/efi). Re-mounting here stacks a second /boot that SHADOWS
+# /boot/efi inside the chroot, making grub-install fail with "cannot find EFI
+# directory". The findmnt guard skips the redundant remount in that case while
+# still mounting /boot for the BIOS / no-ESP path.
+if [[ -n $boot_dev ]] ; then
+    if ! findmnt /target/boot >/dev/null 2>&1 ; then
+        chroot /target mount $boot_dev /boot 2>/dev/null || true
+    fi
+fi
+
+# This test is not complete and should probably be done earlier. grub_dev="efi" above
+if [[ -n "$esp_dev" ]] ; then
+	uefi_ready="yes"
+fi
+
+# add entry for esp_dev to fstab if needed
+if [[ $uefi_ready = "yes" ]] && [[ $uefi_boot = "yes" ]] ; then
+	if [[ $use_uuid = "yes" ]]; then
+		esp_part="$(/sbin/blkid -s UUID $esp_dev | awk '{ print $2 }' | sed 's/\"//g')"
+	else
+		esp_part="$esp_dev"
+	fi
+    echo -e $"\n Adding esp entry to fstab...\n"
+    echo -e "$esp_part\t/boot/efi\tvfat\tumask=0077\t0\t1" >> /target/etc/fstab
+	mkdir -p /target/boot/efi
+
+	# Unmount ESP from any existing mount point (e.g. live system's /boot/efi)
+	# so it's free to mount at /target/boot/efi
+	if findmnt "$esp_dev" >/dev/null 2>&1 ; then
+		umount "$esp_dev"
+	fi
+
+	mount "$esp_dev" /target/boot/efi/ ; check_exit
+
+	# Verify the ESP is actually mounted at /target/boot/efi
+	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
+		echo $"
+ ERROR: Failed to mount EFI partition $esp_dev at /target/boot/efi
+ Cannot install GRUB bootloader. Aborting.
+"
+		exit 1
+	fi
+fi
+
+
+# configure_resume UUID [OFFSET]
+#   Configure the installed system to resume from hibernation. UUID is the block
+#   device that holds the swap: the filesystem device for a swapfile, or the swap
+#   partition itself. OFFSET is the swapfile's resume offset (empty for a swap
+#   partition). Tells the initramfs which device to resume from and adds
+#   resume=/resume_offset= to the kernel command line via GRUB. No-op if no swap.
+configure_resume () {
+	local _uuid="$1" _off="$2" _params _grub="/target/etc/default/grub"
+	[[ -z "$_uuid" ]] && return 0
+	_params="resume=UUID=$_uuid"
+	[[ -n "$_off" ]] && _params="$_params resume_offset=$_off"
+	mkdir -p /target/etc/initramfs-tools/conf.d
+	echo "RESUME=UUID=$_uuid" > /target/etc/initramfs-tools/conf.d/resume
+	if [[ -f "$_grub" ]] && ! grep -q 'resume=UUID=' "$_grub" ; then
+		if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$_grub" ; then
+			sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 $_params\"|" "$_grub"
+		else
+			echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$_params\"" >> "$_grub"
+		fi
+	fi
+	echo -e $"\n Hibernation: resume=UUID=$_uuid ${_off:+resume_offset=$_off}\n"
+}
+
+
+install_grub () {
+# Setup GRUB
+echo -e $"\n Setting up grub bootloader.. Please wait..\n"
+
+# Configure hibernation resume (no-op if there is no swap / encrypted root).
+configure_resume "$resume_uuid" "$resume_offset"
+
+# Verify ESP is mounted for EFI install before running grub-install
+if [[ $grub_dev = "efi" ]] ; then
+	if ! findmnt /target/boot/efi >/dev/null 2>&1 ; then
+		echo $"
+ ERROR: EFI partition is not mounted at /target/boot/efi
+ Cannot install GRUB bootloader. Aborting.
+"
+		exit 1
+	fi
+fi
+
+
+#grubversion=$(dpkg -l | egrep "ii|hi" | grep -v bin | grep -v doc | awk '$2 ~ "grub-[eglp]" { print $2}')
+
+# If grub is installed to a partition, we need to know if it's grub-pc
+# or grub-legacy/grub-gfx to handle it properly.
+if [[ -n $grub_partition ]] ; then
+	if [[ $grubversion != "grub-pc" ]] ; then
+
+		# isolate the device (sdx) letter then use tr like this to translate to the right number for grub
+		GRUBDEVICENUM=$(echo $grub_partition |sed 's:/dev/sd::' |sed 's:[0-9]::'g |tr '[a-j]' '[0-9]')
+
+		# isolate the partition number
+		INSTALLPARTNUM=$(echo $grub_partition |sed 's:/dev/sd::'|sed 's:[a-z]::')
+
+		# and reduce it by 1 for grub
+		GRUBPARTNUM=$(expr $INSTALLPARTNUM - 1)
+
+		# finally get the finished grub root syntax
+		GRUBROOT="(hd$GRUBDEVICENUM,$GRUBPARTNUM)"
+
+
+		chroot /target grub-install $grub_partition
+		grub --batch <<EOF
+		root $GRUBROOT
+		setup $GRUBROOT
+		quit
+EOF
+
+	else
+		chroot /target grub-install --recheck --no-floppy --force $grub_partition >> "$error_log" ; check_exit
+	fi
+
+elif [[ $grub_dev = "efi" ]] ; then
+	chroot /target grub-install ${efi_name_opt} ${media_opt} >> "$error_log"; check_exit
+
+elif [[ -n $grub_dev ]]; then
+    echo -e $"\n Installing the boot loader...\n"
+    chroot /target grub-install $grub_dev >> "$error_log"; check_exit
+fi
+
+chroot /target update-grub ; check_exit
+
+error_message=""
+}
+
+
+copy_grub_packages () {
+
+	find "$grub_package_dir" -maxdepth 1 -name "$grub_package" -exec cp {} /target \;
+#	chroot /target find . -name $grub_package -maxdepth 1 -exec dpkg -i {} \; # this works, but grub-pc/grub-pc-bin installed out of order.
+if [[ -n "$grub_package" ]] ; then
+	chroot /target /bin/bash -c "dpkg -i $grub_package"    # This works. They installed in right order.
+fi
+	if [[ "$grub_package" =~ grub-pc ]] ; then
+		grubversion="grub-pc"
+		select_grub_dev
+	fi
+	if [[ "$grub_package" =~ grub-efi ]] ; then
+		grubversion="grub-efi"
+		grub_dev="efi"
+	fi
+
+}
+
+
+######  INSERT PAUSE TO ALLOW MANUAL WORK BEFORE GRUB (e.g. uefi)
+
+# $grub_package is null if installed grub matches boot type (uefi or bios)
+if [[ -n "$grub_package" ]] ; then
+	grub_opt=$"1) Copy grub packages to /target and install bootloader"
+else
+	grub_opt=$"2) Install bootloader and finish the installation"
+fi
+
+
+while true ; do
+	echo $" ****************************************************************
+	The installed system is ready for chroot. (proc, sys, dev are mounted)
+	If you want, you may work in another virtual terminal.
+	Make a selection when you are ready to proceed.
+
+	${bios_boot_warning}
+
+	Choices (enter number)
+		${grub_opt}
+		3) Continue without a bootloader.
+		4) Abort the installation and exit.
+"
+	read ans
+	case "$ans" in
+		1)	copy_grub_packages
+			if [[ -z "$bios_boot_warning" ]] ; then
+				install_grub
+			fi
+			break ;;
+		2)	if [[ -z "$bios_boot_warning" ]] ; then
+				install_grub
+			fi
+			break ;;
+		3)	break ;;
+		4)	cleanup ; exit 0 ;;
+	esac
+done
+
+
+# Run update-initramfs to include dm-mod if using encryption,
+# to ensure btrfs support is included for btrfs installations,
+# or to embed the hibernation resume device (conf.d/resume).
+if [[ $encrypt_os = yes ]] || [[ $encrypt_home = yes ]] || [[ "$fs_type_os" == "btrfs" ]] || [[ -n "$resume_uuid" ]] ; then
+	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
+		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
+	else
+		chroot /target /usr/sbin/update-initramfs -u -k all >> "$error_log"
+	fi
+fi
+
+##### This should not run if grub_dev=efi and choose 3 above (no bootloader)
+#if [[ -n $grub_dev ]] || [[ -n $grub_partition ]] ; then
+#    chroot /target update-grub ; check_exit 
+#fi
+
+if [ -f /target/boot/grub/setup_left_core_image_in_filesystem ]; then
+	rm -f /target/boot/grub/setup_left_core_image_in_filesystem
+fi
+
+
+
+# INSTALLATION FINISHED - BEGIN CONFIGURE USERNAME, HOSTNAME, PASSWORDS, SUDO
+
+
+# Need to mount the target home partition under the target root partition
+# so the commands can find it (for changing user configs gksu)
+if [[ -n $home_part ]] ; then
+    mount $home_part /target/home
+fi
+
+# it might not be on in some live builds
+chroot /target /bin/bash -c "shadowconfig on"
+
+
+# Change username, user's real name and password.
+oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
+old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
+
+echo $"
+ The current primary user's name is $oldname. If you want to change it,
+ enter the new user name now. To proceed without changing the name, just
+ press ENTER.
+"
+read newname
+	
+if [ -n "$newname" ]; then
+echo $"
+ Enter the new user's real name.
+"
+read new_realname
+fi
+
+
+if [ -z "$newname" ]; then
+newname=$oldname
+fi
+
+if [ "$oldname" != "$newname" ]; then
+
+	chroot /target usermod -l $newname $oldname ; check_exit
+	chroot /target groupmod -n $newname $oldname ; check_exit
+	chroot /target usermod -d /home/$newname -m $newname ; check_exit
+
+	for i in $(grep -r "/home/$oldname" /target/home/$newname/.config | awk -F":" '{ print $1 }'); do
+	sed -i "s/\/home\/$oldname/\/home\/$newname/g" "$i"
+	done
+
+	for i in $(grep -r "/home/$oldname" /target/home/$newname/.local | awk -F":" '{ print $1 }'); do
+	sed -i "s/\/home\/$oldname/\/home\/$newname/g" "$i"
+	done
+
+	
+	while true; do
+		echo $"
+ Change the new user's password?
+   Press ENTER for YES.
+   Press 2 for no.
+"
+		read ans
+		case $ans in
+			[2Nn]*) break ;;
+			*)  # Redirect stderr from the error log to the screen, 
+				# so we can see the prompts from passwd
+				exec 2>&1
+				echo $"Change user's password"
+				chroot /target passwd "$newname"
+				# Resume logging errors in file
+				exec 2>>"$error_log"
+				break ;;
+		esac
+	done
+fi
+
+#sed -i~ "s/$old_realname,,,/$new_realname,,,/" /target/etc/passwd
+chroot /target /bin/bash -c "chfn -f '$new_realname' $newname"
+
+
+
+## sort sudo ##
+
+while true; do
+		echo $"
+ Most live images use 'sudo' for root access. No password is required.
+ It is recommended to disable sudo in an installation and use 'su' 
+ with a root password. Optionally you may permit sudo for the new
+ user or you may use sudo as default for the new user, with no root 
+ account. 
+    
+ Select one (Enter number):
+	1) Disable sudo (recommended)
+	2) Permit sudo for new user (and keep root account.)
+	3) Use sudo as default for new user (and disable root account.)
+	4) Use sudo only for shutdown (and keep root account.)
+"
+		read ans
+		case $ans in
+			[1Aa]) break ;;
+			[2Bb]) sudoconfig="TRUE" ; break ;;
+			[3Cc]) sudo_is_default="TRUE" ; break ;;
+			[4Dd]) sudo_shutdown="TRUE" ; break ;;
+		esac
+	done
+
+# =>wheezy live-config now uses /etc/sudoers.d
+if [ -e /target/etc/sudoers.d/live ]; then
+	rm -f /target/etc/sudoers.d/live
+fi
+
+oldusername=$(awk -F: '/1000:1000/ { print $1 }' /etc/passwd)
+newusername=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
+
+# squeeze (or other distro) might have used /etc/sudoers
+if grep -qs $oldusername /target/etc/sudoers ; then
+	sed -i "/$oldusername/d" /target/etc/sudoers
+fi
+
+if [ "$sudoconfig" = "TRUE" ] || [ "$sudo_is_default" = "TRUE" ]; then
+	# $newusername is permitted to use sudo so add him to sudo group
+	chroot /target usermod -a -G sudo $newusername
+
+		# it shoud be already there in =>wheezy.. in case it's not: 
+		if ! grep -qs "^%sudo" /target/etc/sudoers ; then 
+			echo "%sudo ALL=(ALL:ALL) ALL" >> /etc/sudoers
+		fi
+fi
+
+if [ "$sudo_is_default" = "TRUE" ]; then
+	# disable root account
+	echo $"disabling root account.. "
+	chroot /target passwd -l root
+else
+	# files that may have been written by live-config to force live sudo mode
+
+	# should they just be deleted?
+
+	# rm -f /target/home/*/.gconf/apps/gksu/%gconf.xml
+	# rm -f /target/home/*/.*/share/config/*desurc
+
+	# fix gksu in user's home ($newusername will not use sudo by default)
+	if [ -f /target/home/"$newusername"/.gconf/apps/gksu/%gconf.xml ]; then
+		sed -i '/sudo-mode/s/true/false/' /target/home/"$newusername"/.gconf/apps/gksu/%gconf.xml
+	fi
+
+	sed -i 's/SU_TO_ROOT_SU=sudo/SU_TO_ROOT_SU=su/' /target/home/$newusername/.su-to-rootrc
+	# detects .kde/ .kde4/ .trinity/ (kdesurc or tdesurc)
+	for file in /target/home/$newusername/.*/share/config/*desurc ; do
+		sed -i 's/super-user-command=sudo/super-user-command=su/' $file
+	done
+fi
+
+if [ "$sudo_shutdown" = "TRUE" ]; then
+	### Maybe move this up so it's available to option "a" (disable sudo) ########
+	sudo_include_file="/target/etc/sudoers.d/user_shutdown"
+	if [ -f "$sudo_include_file" ]; then
+		mv "$sudo_include_file" "${sudo_include_file}.old"
+	fi
+	
+	echo "$newusername ALL= NOPASSWD: /usr/sbin/pm-suspend, /usr/sbin/pm-hibernate, /sbin/halt, /sbin/reboot" > "$sudo_include_file"
+fi
+
+if [ "$sudo_is_default" != "TRUE" ]; then
+	# Make sure user gets removed from sudo group. In 2021/2022 sudo group is carried into installed system. Not sure why.
+	if [ "$sudoconfig" != "TRUE" ] ; then
+		chroot /target deluser "$newusername" sudo
+	fi
+	while true; do
+		echo $"
+ Change root password?
+	Press ENTER for YES.
+	Press 2 for no.
+"
+		read ans
+		case $ans in
+		[2Nn]*) break ;;
+		*)
+			# Redirect stderr from the error log to the screen, 
+			# so we can see the prompts from passwd
+			exec 2>&1
+			echo $"Change root password"
+			chroot /target passwd
+			# Resume logging errors in file
+			exec 2>>"$error_log"
+			break ;;
+		esac
+	done
+fi
+
+
+if [[ $disable_auto_desktop = "yes" ]]; then
+	set_noautologin_desktop
+	disable_auto_console="yes"
+else
+	set_autologin_desktop
+fi   
+    
+
+# Disable console autologin
+if [[ $disable_auto_console = "yes" ]]; then
+	if grep -q "respawn:/bin/login -f" /target/etc/inittab ; then
+		mv /target/etc/inittab /target/etc/inittab.$(date +%Y%m%d_%H%M)
+		cp /usr/lib/refractainstaller/inittab.debian /target/etc/inittab
+	fi
+	if grep -q "$oldusername" /target/etc/sv/getty-tty*/run ; then
+		sed -i 's/^\(.*\)getty\(.*\)-a\(.*\)'$oldusername'\(.*\)38400/\1getty 38400/' /target/etc/sv/getty-tty*/run
+	fi
+else
+	sed -i "/respawn:/s/$oldusername/$newusername/g" /target/etc/inittab
+	if [ -e /target/etc/sv/getty-tty*/run ] ; then
+		sed -i "/38400/s/$oldusername/$newusername/" /target/etc/sv/getty-tty*/run
+	fi
+fi
+
+
+# Remove diversion of anacron
+if [ -e /target/usr/sbin/anacron.orig.anacron ] ; then
+	rm -f /target/usr/sbin/anacron
+	chroot /target dpkg-divert --rename --remove /usr/sbin/anacron
+fi
+
+
+if [[ $additional_partitions = "yes" ]] ; then
+	if ! [[ -h /usr/lib/refractainstaller/post-install/move-dir-mount-gui.sh ]] ; then
+		ln -s /usr/lib/refractainstaller/move-dir-mount-gui.sh /usr/lib/refractainstaller/post-install/move-dir-mount-gui.sh
+	fi
+else
+	if [[ -h /usr/lib/refractainstaller/post-install/move-dir-mount.sh ]] ; then
+		rm /usr/lib/refractainstaller/post-install/move-dir-mount.sh
+	fi
+fi
+
+
+# Run any post-install scripts
+if [[ $run_postinstall = "yes" ]] ; then
+	for file in /usr/lib/refractainstaller/post-install/* ; do
+		if [[ -x "$file" ]] ; then
+			bash "$file"
+		fi
+	done
+fi
+
+
+# Stop dual logging and do final sync
+if [[ -n "$_log_tail_pid" ]]; then
+	kill "$_log_tail_pid" 2>/dev/null
+	wait "$_log_tail_pid" 2>/dev/null
+fi
+# Final sync of error log to target
+[[ -n "$_target_error_log" ]] && cp "$error_log" "$_target_error_log" 2>/dev/null
+
+# copy error log to installation before calling cleanup function
+cp "$error_log" /target/home/"$newusername"/
+chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
+cleanup
+
+echo $"
+	Done! You may now reboot into the new system.
+	If you want to change the user name, then run
+	change-username after reboot.
+"
+exit 0
