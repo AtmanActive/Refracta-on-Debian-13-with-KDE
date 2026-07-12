@@ -1,6 +1,6 @@
 From: Refracta user
-Date: 2026-07-05
-Subject: [PATCH] refractasnapshot: default "seed /etc/skel + UEFI" snapshot mode
+Date: 2026-07-12
+Subject: [PATCH v2] refractasnapshot: seed /etc/skel + UEFI mode; theme-aware xterm colours
 
 Incorporates the standalone /etc/skel seeding step directly into refractasnapshot
 (both CLI and GUI), the same way btrfs-disk-lib.sh was folded into
@@ -39,15 +39,84 @@ Refactor:
   The task-1 body is factored into run_create_snapshot[_gui]() so the new default
   mode and the classic mode share one code path (flags: seed_skel, fast_mode).
 
+Theme-aware xterm colours (v2, 2026-07-12):
+
+  Like the installer's v16 change, the snapshot GUI runs inside a plain xterm
+  (spawned by refractasnapshot-wrapper.sh) that ignores the desktop light/dark
+  setting and always renders black-on-white, unlike the GTK yad dialogs. An
+  inlined, best-effort helper (refracta_xterm_theme, computed once into $XTC)
+  now makes those xterms match the desktop's light/dark preference when it can
+  be determined - KDE window-background luminance / ColorScheme name via
+  kreadconfig6/5, else the gsettings color-scheme hint - and otherwise emits
+  NOTHING so xterm keeps its built-in colours. No new file, no new dependency;
+  each detection step is skipped if its tool is absent and anything ambiguous
+  yields no output. When launched as root via sudo/su it reads the invoking
+  user's KDE config (SUDO_USER -> getent home). Cosmetic only - the snapshot
+  flow is unchanged. Palette matches Breeze (dark #232629/#fcfcfc, light
+  reversed, cursor #3daee9). refractasnapshot-wrapper.sh is patched here for the
+  first time; refractasnapshot-gui's "yad not installed" xterm is themed too.
+  refractasnapshot (CLI) and skel-seed-lib.sh are unchanged in v2.
+
 Files:
 
-  usr/bin/refractasnapshot-gui                     (GUI: default seed+UEFI task)
+  usr/bin/refractasnapshot-gui                     (seed+UEFI task; xterm colours)
+  usr/bin/refractasnapshot-wrapper.sh              (progress-window xterm colours; NEW)
   usr/bin/refractasnapshot                         (CLI: default seed+UEFI task)
   usr/lib/refractasnapshot/skel-seed-lib.sh        (new shared library)
 
 --- a/usr/bin/refractasnapshot-gui
 +++ b/usr/bin/refractasnapshot-gui
-@@ -125,6 +125,13 @@
+@@ -5,6 +5,40 @@
+ TEXTDOMAIN=refractasnapshot-gui
+ TEXTDOMAINDIR=/usr/share/locale/
+ 
++# --- theme-aware xterm colours (best-effort; silent + never a dependency) ---
++# refracta_xterm_theme echoes xterm colour flags matching the desktop's
++# light/dark preference, or NOTHING if it can't tell (so xterm keeps its
++# built-in colours). It never errors, hangs, or requires the query tools.
++# When run as root via sudo it reads the invoking user's KDE config.
++refracta_xterm_theme() {
++	local mode="" k bg r g b s cs home="$HOME"
++	if [[ $EUID -eq 0 && -n $SUDO_USER ]]; then
++		home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
++		[[ -d $home ]] || home="$HOME"
++	fi
++	if   command -v kreadconfig6 >/dev/null 2>&1; then k=kreadconfig6
++	elif command -v kreadconfig5 >/dev/null 2>&1; then k=kreadconfig5 ; fi
++	if [[ -n $k ]]; then
++		bg=$(HOME="$home" "$k" --file kdeglobals --group 'Colors:Window' --key BackgroundNormal 2>/dev/null)
++		IFS=',' read -r r g b _ <<< "$bg"
++		if [[ $r =~ ^[0-9]+$ && $g =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]]; then
++			(( (r*299 + g*587 + b*114) / 1000 < 128 )) && mode=dark || mode=light
++		else
++			s=$(HOME="$home" "$k" --file kdeglobals --group General --key ColorScheme 2>/dev/null)
++			case "${s,,}" in *dark*) mode=dark ;; *light*) mode=light ;; esac
++		fi
++	fi
++	if [[ -z $mode ]] && command -v gsettings >/dev/null 2>&1; then
++		cs=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)
++		case "$cs" in *prefer-dark*) mode=dark ;; *prefer-light*) mode=light ;; esac
++	fi
++	case "$mode" in
++		dark)  printf '%s' '-bg #232629 -fg #fcfcfc -cr #3daee9' ;;
++		light) printf '%s' '-bg #fcfcfc -fg #232629 -cr #3daee9' ;;
++	esac
++}
++XTC="$(refracta_xterm_theme)"
++
+ # Copyright: fsmithred@gmail.com 2011-2023
+ # based on refractasnapshot-8.0.4 by Dean Linkous
+ # Some (much) code contributed by David Hare.
+@@ -109,7 +143,7 @@
+ 
+ else
+ 
+-	xterm -fa monaco -fs 12 -hold -e echo $"
++	xterm $XTC -fa monaco -fs 12 -hold -e echo $"
+   Yad is not installed. You can't run the GUI version of
+   Refracta Snapshot without it. Instead, you can run
+   'refractasnapshot' from a terminal or console for the CLI version.
+@@ -125,6 +159,13 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -61,7 +130,7 @@ Files:
  
  ######## FUNCTIONS
  
-@@ -565,37 +572,29 @@
+@@ -565,37 +606,29 @@
  }
  
  
@@ -88,8 +157,6 @@ Files:
 -  04 $"Re-run xorriso only. (make iso, no-copy, no-squash)" \
 -  05 $"Setup snapshot (edit config file or excludes file)" \
 -  06 $"Exit")
--
--exit_code="$?"
 +# Seed /etc/skel from the desktop user's home (for the UEFI+Skel snapshot mode).
 +seed_skel_now_gui () {
 +	if ! type refracta_seed_skel >/dev/null 2>&1 ; then
@@ -108,10 +175,12 @@ Files:
 +	fi
 +}
  
+-exit_code="$?"
+ 
 -if [ "$exit_code" -ne 0 ]; then
 -    show_snapshot_help
 -fi
- 
+-
 -if [[ $task =~ 01 ]] ; then
 +# Shared body for the "create a snapshot" tasks. Honours two flags:
 +#   seed_skel=yes  -> seed /etc/skel before copying the filesystem
@@ -120,7 +189,7 @@ Files:
  
  	please_wait
  	check_copies
-@@ -605,11 +604,17 @@
+@@ -605,11 +638,17 @@
  		check_initrd
  	fi
  	kill "$wait_pid"
@@ -139,7 +208,7 @@ Files:
  	if [[ $initrd_crypt = "yes" ]] ; then
  		prepare_initrd_crypt
  	fi
-@@ -624,23 +629,69 @@
+@@ -624,23 +663,69 @@
  	fi
  	edit_system
  	get_filename
@@ -214,7 +283,7 @@ Files:
  	exit 0
  fi
  
-@@ -768,10 +819,12 @@
+@@ -768,10 +853,12 @@
  		DISTRO="Refracta"
  	fi
  
@@ -227,6 +296,61 @@ Files:
  
  	if [[ -z "$DISTRO" ]] ; then
  		DISTRO="GNU/Linux `uname -r`"
+--- a/usr/bin/refractasnapshot-wrapper.sh
++++ b/usr/bin/refractasnapshot-wrapper.sh
+@@ -4,6 +4,40 @@
+ 
+ command="/usr/bin/refractasnapshot-gui"
+ 
++# --- theme-aware xterm colours (best-effort; silent + never a dependency) ---
++# refracta_xterm_theme echoes xterm colour flags matching the desktop's
++# light/dark preference, or NOTHING if it can't tell (so xterm keeps its
++# built-in colours). It never errors, hangs, or requires the query tools.
++# When run as root via sudo it reads the invoking user's KDE config.
++refracta_xterm_theme() {
++	local mode="" k bg r g b s cs home="$HOME"
++	if [[ $EUID -eq 0 && -n $SUDO_USER ]]; then
++		home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
++		[[ -d $home ]] || home="$HOME"
++	fi
++	if   command -v kreadconfig6 >/dev/null 2>&1; then k=kreadconfig6
++	elif command -v kreadconfig5 >/dev/null 2>&1; then k=kreadconfig5 ; fi
++	if [[ -n $k ]]; then
++		bg=$(HOME="$home" "$k" --file kdeglobals --group 'Colors:Window' --key BackgroundNormal 2>/dev/null)
++		IFS=',' read -r r g b _ <<< "$bg"
++		if [[ $r =~ ^[0-9]+$ && $g =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]]; then
++			(( (r*299 + g*587 + b*114) / 1000 < 128 )) && mode=dark || mode=light
++		else
++			s=$(HOME="$home" "$k" --file kdeglobals --group General --key ColorScheme 2>/dev/null)
++			case "${s,,}" in *dark*) mode=dark ;; *light*) mode=light ;; esac
++		fi
++	fi
++	if [[ -z $mode ]] && command -v gsettings >/dev/null 2>&1; then
++		cs=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)
++		case "$cs" in *prefer-dark*) mode=dark ;; *prefer-light*) mode=light ;; esac
++	fi
++	case "$mode" in
++		dark)  printf '%s' '-bg #232629 -fg #fcfcfc -cr #3daee9' ;;
++		light) printf '%s' '-bg #fcfcfc -fg #232629 -cr #3daee9' ;;
++	esac
++}
++XTC="$(refracta_xterm_theme)"
++
+ # I hope nobody uses this, but it's here
+ # in case you're running a root xsession.
+ if [[ $(id -u) -eq 0 ]] ; then
+@@ -36,9 +70,9 @@
+ elif
+ 	# for sudo with password
+ 	$(groups $USER | grep -qs sudo); then
+-	xterm -fa mono -fs 12 -e  "sudo $command" 
++	xterm $XTC -fa mono -fs 12 -e  "sudo $command" 
+ else
+-	xterm -fa mono -fs 12 -e su -c "$command"
++	xterm $XTC -fa mono -fs 12 -e su -c "$command"
+ fi
+ 
+ exit 0
 --- a/usr/bin/refractasnapshot
 +++ b/usr/bin/refractasnapshot
 @@ -96,6 +96,13 @@

@@ -66,7 +66,7 @@ A one-time, idempotent setup script (safe to re-run, each step checks state and 
 **Preparation Step 2: Apply the patches.**
 
 ```bash
-# btrfs support for refractainstaller (v9.6.6 → v9.6.6.15)
+# btrfs support for refractainstaller (v9.6.6 → v9.6.6.16)
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 
 # default "seed /etc/skel + UEFI" snapshot mode for refractasnapshot
@@ -77,14 +77,14 @@ Two standard unified diffs.
 
 <details>
 
-**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, and (v15) the same SDDM autologin fix ported to the CLI installer.
+**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, (v15) the same SDDM autologin fix ported to the CLI installer, and (v16) theme-aware colours for the progress xterm so it follows the desktop's light/dark mode instead of always being black-on-white.
 
-**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below).
+**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below); **(v2)** it also gives the snapshot's progress xterm the same theme-aware colours as the installer's v16, and patches `refractasnapshot-wrapper.sh` for that.
 
 See the [Developers](#developers) section for the full version history.
 </details>
 
-Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.15/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.1/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable.
+Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.16/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.2/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable. Both builds now also include the `*-wrapper.sh` launchers.
 
 ## Usage (every time you want to pack an ISO)
 
@@ -207,10 +207,10 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 | `btrfs-support-for-refractainstaller.patch` | The patch. Applied against the **pristine** 9.6.6 scripts (not the installed copies, which can be stale). Patches `refractainstaller-yad` + `refractainstaller` and creates the shared library. |
 | `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
 | `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
-| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.15/`), including `btrfs-disk-lib.sh`. |
+| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.16/`), including `btrfs-disk-lib.sh` and (from v16) `refractainstaller-wrapper.sh`. |
 | `skel-seed-for-refractasnapshot.patch` | The patch that folds `/etc/skel` seeding into refractasnapshot. Applied against the **pristine** 10.4.3/10.4.1 scripts. Patches `refractasnapshot` + `refractasnapshot-gui` and creates the shared library. |
 | `skel-seed-lib.sh` | **Single source of truth** for `/etc/skel` seeding. Defines the dotfile / config / app-data arrays and the copy logic. The patch installs it to `/usr/lib/refractasnapshot/skel-seed-lib.sh`; the standalone seed script sources it (falling back to a copy beside itself). Edit the arrays here and the snapshot tools + the standalone script all follow. |
-| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.1/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`. |
+| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.2/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh` and (from v2) `refractasnapshot-wrapper.sh`. |
 | `install_and_prepare_refracta_on_debian13.sh` | Source-machine setup (see Usage). |
 | `refracta_seed_home_environment_before_iso_creation.sh` | Standalone `/etc/skel` seeder — now a thin CLI wrapper around `skel-seed-lib.sh` (the snapshot tools' default mode does the same thing). |
 
@@ -490,6 +490,21 @@ Note: the CLI installer had the **same** missing-SDDM bug — fixed in v15 below
 v14 fixed SDDM autologin in the GUI installer only. The CLI installer (`refractainstaller`) has the identical defect: its "Disable auto-login?" prompt (ENTER = YES) called `set_noautologin_desktop`, which — like the GUI's before v14 — had no SDDM branch, so on KDE/Debian 13 the autologin was never disabled.
 
 v15 adds the **exact same two blocks** to the CLI's `set_noautologin_desktop` (comment `User=` under `[Autologin]` in `/etc/sddm.conf` + `/etc/sddm.conf.d/*.conf`) and `set_autologin_desktop` (rename `User=` there). The CLI has no automated (`auto_mode`) flow, so no extra question is needed — it already prompts about autologin in its normal sequence; only the missing SDDM handling was the bug. (`refractainstaller-yad` and `btrfs-disk-lib.sh` are unchanged in v15.)
+
+</details>
+
+<details>
+<summary><b>v16 — theme-aware xterm colours (respect KDE light/dark) — also snapshot v2</b></summary>
+
+Both GUI tools run their progress output in a plain **xterm** (the installer always; the snapshot GUI when it needs a password terminal). Unlike the `yad` dialogs — which are GTK and follow the desktop theme — xterm has no idea about the OS light/dark setting and always renders **black text on a white background**. On a dark-themed KDE Plasma / Debian 13 desktop that terminal looks out of place.
+
+v16 (installer) and the parallel **snapshot v2** make those xterms follow the desktop's light/dark preference — and, crucially, **only when it can be determined**. A small helper is inlined near the top of each script (`refractainstaller-wrapper.sh` + `refractainstaller-yad`; `refractasnapshot-wrapper.sh` + `refractasnapshot-gui`) — no new file, no new dependency:
+
+- `refracta_xterm_theme()` echoes xterm colour flags (`-bg`/`-fg`/`-cr`) matching the desktop mode, or **nothing** if it can't tell — in which case xterm keeps its built-in colours. Every `xterm` call becomes `xterm $XTC …`, and an empty `$XTC` adds zero arguments, so behaviour is identical to before when detection fails.
+- Detection is best-effort and never fatal: (1) the KDE window background colour via `kreadconfig6`/`5` (`[Colors:Window]` `BackgroundNormal`), classified by luminance — theme-name agnostic; (2) the `ColorScheme` name containing *dark*/*light*; (3) the XDG/GNOME `gsettings` `color-scheme` hint. Each step is skipped if its tool is absent; anything ambiguous → no output. So it **respects** KDE's dark/light mode without **requiring** any of those tools.
+- When a tool runs the terminal as root (the GUIs are launched via `sudo`/`su`), the helper reads the invoking user's KDE config (`SUDO_USER` → `getent` home), so the root-context xterms (partition tool, chroot, the snapshot GUI) also match.
+
+Colours match Breeze (dark `#232629`/`#fcfcfc`, light reversed, cursor `#3daee9`). Cosmetic only — no install or snapshot behaviour changes. This is the first time `refractainstaller-wrapper.sh` and `refractasnapshot-wrapper.sh` are patched. (CLI installer, `btrfs-disk-lib.sh`, snapshot CLI and `skel-seed-lib.sh` are all unchanged.)
 
 </details>
 

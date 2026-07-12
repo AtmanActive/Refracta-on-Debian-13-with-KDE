@@ -1,43 +1,90 @@
 From: Refracta user
-Date: 2026-07-11
-Subject: [PATCH v15] CLI installer: fix desktop autologin on SDDM (KDE Plasma)
+Date: 2026-07-12
+Subject: [PATCH v16] GUI installer: theme-aware xterm colours (respect KDE light/dark)
 
-Building on v1-v14. v14 fixed the SDDM desktop-autologin bug in the GUI
-installer (refractainstaller-yad) but explicitly left the CLI installer
-(refractainstaller) alone. The CLI has the SAME defect: no SDDM support at all,
-so on KDE Plasma / Debian 13 the "Disable auto-login?" prompt (which defaults to
-YES) never actually disabled autologin - /etc/sddm.conf's [Autologin] was left
-intact and cloned into the installed system.
+Building on v1-v15. Cosmetic-only: the progress terminal the GUI installer runs
+in is a plain xterm, which - unlike the yad dialogs (GTK, they follow the desktop
+theme) - has no idea about the OS light/dark setting and always renders black-on-
+white. On a dark-themed KDE Plasma / Debian 13 desktop that xterm looks out of
+place. This makes those xterms follow the desktop's light/dark preference when it
+can be determined, and otherwise leaves xterm's built-in colours alone.
 
-Background (same as v14): Debian live-config /lib/live/config/0085-sddm writes
-/etc/sddm.conf ([Autologin] / User=<liveuser> / Session=plasma.desktop) at live
-boot; the installer's rsync copies it into /target. The CLI's
-set_noautologin_desktop / set_autologin_desktop handled gdm/gdm3/lightdm/kdm/
-kde-kdm/trinity/slim/lxdm/"no DM" but never /etc/sddm.conf.
+Nothing about the install flow changes; only xterm colours.
 
-What changes (v15, CLI installer only):
+New helper (inlined near the top of each affected script, so no new file and no
+new dependency):
 
-  - set_noautologin_desktop (CLI) now comments the `User=` line inside the
-    `[Autologin]` section of /target/etc/sddm.conf and /target/etc/sddm.conf.d/
-    *.conf (section-scoped `/^\[Autologin\]/,/^\[/`, so a `User=` in another
-    section is untouched).
-  - set_autologin_desktop (CLI) now rewrites `User=<olduser>` to `<newuser>` in
-    the same section(s), so "keep autologin" survives a username change.
+  refracta_xterm_theme() echoes xterm colour flags (-bg/-fg/-cr) matching the
+  desktop's light/dark mode, or NOTHING if it cannot tell - in which case xterm
+  keeps its defaults. Detection is best-effort and never fatal:
+    1. KDE window background colour (kreadconfig6/5, [Colors:Window]
+       BackgroundNormal) classified by luminance - theme-name agnostic;
+    2. KDE ColorScheme name containing dark/light as a fallback;
+    3. the XDG/GNOME color-scheme hint (gsettings prefer-dark/prefer-light).
+  Each step is skipped if its tool is absent; anything ambiguous -> no output.
+  When the installer runs as root via sudo it reads the invoking user's KDE
+  config (SUDO_USER -> getent home), so the root-context xterms (partition tool,
+  chroot) also match. The result is computed once into $XTC and each xterm call
+  becomes `xterm $XTC ...` ($XTC unquoted, so empty adds zero arguments).
 
-These are the exact same two blocks added to the GUI in v14. The CLI has no
-`auto_mode`, so no autologin question is needed - it already prompts
-"Disable auto-login?" (ENTER = YES) in its normal flow; only the missing SDDM
-handling was the bug.
+What changes (v16):
 
-Changes from v14:
-  - refractainstaller (CLI): add SDDM handling to set_noautologin_desktop and
-    set_autologin_desktop. Nothing else changes.
-  - (refractainstaller-yad and btrfs-disk-lib.sh unchanged from v14.)
+  - refractainstaller-wrapper.sh: inline the helper; the main installer progress
+    window and the "yad not installed" message xterm become theme-aware. This
+    wrapper runs as the desktop user, so it detects the theme directly.
+  - refractainstaller-yad: inline the helper; the partition-tool xterm and the
+    chroot xterm become theme-aware (root-context, via SUDO_USER).
+  - refractainstaller (CLI) and btrfs-disk-lib.sh: unchanged from v15 (the CLI
+    is text-only and launches no xterm).
+
+Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
+#3daee9). refractainstaller-wrapper.sh is patched here for the first time.
 
 ---
 --- a/usr/bin/refractainstaller-yad
 +++ b/usr/bin/refractainstaller-yad
-@@ -52,6 +52,86 @@
+@@ -5,6 +5,40 @@
+ TEXTDOMAIN=refractainstaller-gui
+ TEXTDOMAINDIR=/usr/share/locale/
+ 
++# --- theme-aware xterm colours (best-effort; silent + never a dependency) ---
++# refracta_xterm_theme echoes xterm colour flags matching the desktop's
++# light/dark preference, or NOTHING if it can't tell (so xterm keeps its
++# built-in colours). It never errors, hangs, or requires the query tools.
++# When run as root via sudo it reads the invoking user's KDE config.
++refracta_xterm_theme() {
++	local mode="" k bg r g b s cs home="$HOME"
++	if [[ $EUID -eq 0 && -n $SUDO_USER ]]; then
++		home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
++		[[ -d $home ]] || home="$HOME"
++	fi
++	if   command -v kreadconfig6 >/dev/null 2>&1; then k=kreadconfig6
++	elif command -v kreadconfig5 >/dev/null 2>&1; then k=kreadconfig5 ; fi
++	if [[ -n $k ]]; then
++		bg=$(HOME="$home" "$k" --file kdeglobals --group 'Colors:Window' --key BackgroundNormal 2>/dev/null)
++		IFS=',' read -r r g b _ <<< "$bg"
++		if [[ $r =~ ^[0-9]+$ && $g =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]]; then
++			(( (r*299 + g*587 + b*114) / 1000 < 128 )) && mode=dark || mode=light
++		else
++			s=$(HOME="$home" "$k" --file kdeglobals --group General --key ColorScheme 2>/dev/null)
++			case "${s,,}" in *dark*) mode=dark ;; *light*) mode=light ;; esac
++		fi
++	fi
++	if [[ -z $mode ]] && command -v gsettings >/dev/null 2>&1; then
++		cs=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)
++		case "$cs" in *prefer-dark*) mode=dark ;; *prefer-light*) mode=light ;; esac
++	fi
++	case "$mode" in
++		dark)  printf '%s' '-bg #232629 -fg #fcfcfc -cr #3daee9' ;;
++		light) printf '%s' '-bg #fcfcfc -fg #232629 -cr #3daee9' ;;
++	esac
++}
++XTC="$(refracta_xterm_theme)"
++
+ 
+  # Copyright 2011-2021 fsmithred@gmail.com
+  # Portions may be copyright Dean Linkous and/or David Hare and/or others.
+@@ -52,6 +86,86 @@
  
  configfile="/etc/refractainstaller.conf"
  
@@ -124,7 +171,7 @@ Changes from v14:
  if [[ -f $configfile ]]; then
      source $configfile
  else
-@@ -114,6 +194,13 @@
+@@ -114,6 +228,13 @@
  # (setting it in wrapper script no longer works.)
  	set -x
  
@@ -138,7 +185,7 @@ Changes from v14:
  # Check that xserver is running and user is root.
  [[ $DISPLAY ]] || { echo $"There is no xserver running. Exiting..." ; exit 1 ; }
  if [[ $(id -u) -ne 0 ]] ; then
-@@ -130,6 +217,60 @@
+@@ -130,6 +251,60 @@
  # Record errors in a logfile.
  exec 2>"$error_log"
  echo "Version:	$version" >> "$error_log"
@@ -199,7 +246,7 @@ Changes from v14:
  #******************************************************************
  
  # Make sure yad is installed, and check the version. *** What version is really needed??? ***
-@@ -156,6 +297,42 @@
+@@ -156,6 +331,42 @@
  fi
  
  
@@ -242,7 +289,7 @@ Changes from v14:
  # Greeting window
  yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
  	--button=$"Continue":0 --button=$"Exit":1 \
-@@ -179,6 +356,134 @@
+@@ -179,6 +390,134 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -377,7 +424,7 @@ Changes from v14:
  # function to exit the script if there are errors
  check_exit () {
  exit_code="$?"
-@@ -331,6 +636,9 @@
+@@ -331,6 +670,9 @@
  "
  	fi
  
@@ -387,7 +434,7 @@ Changes from v14:
  	yad --title=$"$window_title" --width=480 --button=$"Help":0 \
  	--button=$"Continue":1 --button=$"Exit":2 --center --borders=10 \
  	--text=$"
-@@ -341,11 +649,12 @@
+@@ -341,11 +683,12 @@
  DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
  	"
  	answer="$?"
@@ -401,7 +448,7 @@ Changes from v14:
  else
  	# not uefi, do bios install.
  	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
-@@ -430,6 +739,9 @@
+@@ -430,6 +773,9 @@
  fi
  
  
@@ -411,19 +458,19 @@ Changes from v14:
  # Select installation options
  
  opts=$(yad --list --title=$"Installation Options" --center --borders=10 \
-@@ -557,10 +869,73 @@
+@@ -557,10 +903,73 @@
          fi
      fi
      # end test for cryptsetup
 -fi    
 +fi
-+
-+fi   # end: expert installation-options screen (skipped in automated mode)
-+
  
-+## Partition a disk #####
++fi   # end: expert installation-options screen (skipped in automated mode)
  
 -## Partition a disk ##### 
++
++## Partition a disk #####
++
 +
 +# Explain the manifest-driven btrfs subvolume install flow and show an example.
 +show_btrfs_manifest () {
@@ -487,7 +534,7 @@ Changes from v14:
  
  
  list_disks () {
-@@ -571,6 +946,99 @@
+@@ -571,6 +980,99 @@
  	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
  }
  
@@ -587,7 +634,7 @@ Changes from v14:
  partition_disk () {
  if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
  	cli_partition_tool="gdisk"
-@@ -578,20 +1046,31 @@
+@@ -578,20 +1080,31 @@
  	cli_partition_tool="cfdisk"
  fi
  
@@ -613,7 +660,7 @@ Changes from v14:
 -		1)  xterm -T "Close this terminal after partioning" -fa mono -fs 12 -geometry 90x25+0+0 -hold -e "$cli_partition_tool" ;;
 -		2)  ;;
 +		0) 	gparted ; break ;;
-+		1)  xterm -T "Close this terminal after partioning" -fa mono -fs 12 -geometry 90x25+0+0 -hold -e "$cli_partition_tool" ; break ;;
++		1)  xterm $XTC -T "Close this terminal after partioning" -fa mono -fs 12 -geometry 90x25+0+0 -hold -e "$cli_partition_tool" ; break ;;
 +		4)  show_btrfs_manifest ;;
 +		5)  guided_btrfs_setup && break ;;
 +		2)  break ;;
@@ -624,7 +671,7 @@ Changes from v14:
  
  }
  
-@@ -611,8 +1090,16 @@
+@@ -611,8 +1124,16 @@
  fi
  
  
@@ -643,7 +690,7 @@ Changes from v14:
  
  ask_format_efi () {
  
-@@ -778,7 +1265,7 @@
+@@ -778,7 +1299,7 @@
  boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
  }
  
@@ -652,7 +699,7 @@ Changes from v14:
      choose_boot
  fi
  
-@@ -845,16 +1332,20 @@
+@@ -845,16 +1366,20 @@
  fi
  }
  
@@ -676,7 +723,7 @@ Changes from v14:
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +1358,48 @@
+@@ -867,10 +1392,48 @@
  fi  
  }
  
@@ -726,7 +773,7 @@ Changes from v14:
  fi
  
  
-@@ -977,6 +1506,158 @@
+@@ -977,6 +1540,158 @@
  
  
  
@@ -885,7 +932,7 @@ Changes from v14:
  # Show a summary of what will be done
  
  if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
-@@ -1251,9 +1932,49 @@
+@@ -1251,9 +1966,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -937,7 +984,7 @@ Changes from v14:
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +2054,70 @@
+@@ -1333,14 +2088,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -1011,7 +1058,7 @@ Changes from v14:
  fi
  
  
-@@ -1372,6 +2149,16 @@
+@@ -1372,6 +2183,16 @@
          sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
      fi
  
@@ -1028,7 +1075,7 @@ Changes from v14:
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
-@@ -1447,6 +2234,16 @@
+@@ -1447,6 +2268,16 @@
          sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
      fi
  
@@ -1045,7 +1092,7 @@ Changes from v14:
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
-@@ -1531,9 +2328,23 @@
+@@ -1531,9 +2362,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -1070,7 +1117,7 @@ Changes from v14:
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2405,12 @@
+@@ -1594,10 +2439,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1084,7 +1131,7 @@ Changes from v14:
  fi
  
  
-@@ -1674,13 +2487,28 @@
+@@ -1674,13 +2521,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -1116,7 +1163,7 @@ Changes from v14:
  fi
  
  
-@@ -1690,13 +2518,57 @@
+@@ -1690,13 +2552,57 @@
  
  
   
@@ -1177,7 +1224,16 @@ Changes from v14:
  fi
  
  
-@@ -1793,6 +2665,10 @@
+@@ -1765,7 +2671,7 @@
+ 
+ chroot_terminal () {
+ 
+-xterm -fa mono -fs 12 -geometry 90x20+0+0 -e 'chroot /target'
++xterm $XTC -fa mono -fs 12 -geometry 90x20+0+0 -e 'chroot /target'
+ 
+ }
+ 
+@@ -1793,6 +2699,10 @@
  fi
  
  # Pause to allow manual changes to /target for UEFI boot.
@@ -1188,7 +1244,7 @@ Changes from v14:
  df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
  	--text=$"${bios_boot_warning}
  ${grub_message}
-@@ -1808,6 +2684,7 @@
+@@ -1808,6 +2718,7 @@
  " \
  "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
  answer="$?"
@@ -1196,7 +1252,7 @@ Changes from v14:
  
  if [[ $answer = 1 ]] ; then
  	chroot_terminal
-@@ -1836,7 +2713,8 @@
+@@ -1836,7 +2747,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -1206,13 +1262,12 @@ Changes from v14:
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1874,60 +2752,17 @@
+@@ -1874,60 +2786,17 @@
  oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
  old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
  
 -username_dialog() {
-+# hostname/username collected up front (v13); nothing to ask here.
- 
+-
 -	newuser=$(yad --form --title=$"Configure hostname and username..." --center --borders=10 --button=$"OK":0 \
 -	--text=$"\n You should change the hostname and username \n \
 -	(optional but recommended) \n" \
@@ -1223,7 +1278,8 @@ Changes from v14:
 -	--field=$"Use sudo as default for new user\? (and disable root account)":CHK \
 -	--field=$"Use sudo only for shutdown\? (and keep root account)":CHK \
 -	"$HOSTNAME" "$oldname" "$old_realname" FALSE FALSE FALSE)
--
++# hostname/username collected up front (v13); nothing to ask here.
+ 
 -	new_hostname=$(echo $newuser |awk -F "|" '{print $1}')
 -	newname=$(echo $newuser |awk -F "|" '{print $2}')
 -	new_realname=$(echo $newuser |awk -F "|" '{print $3}')
@@ -1271,7 +1327,7 @@ Changes from v14:
  	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
  	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
  fi
-@@ -2053,72 +2888,15 @@
+@@ -2053,72 +2922,15 @@
  
  ## passwords ##
  
@@ -1349,7 +1405,7 @@ Changes from v14:
  
  
  	if [ -n "$newpass" ]; then
-@@ -2133,8 +2911,8 @@
+@@ -2133,8 +2945,8 @@
  # do user password
  set_userpass() {
  
@@ -1360,7 +1416,7 @@ Changes from v14:
  
  	if [ -n "$newpass" ]; then
  		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
-@@ -2166,6 +2944,14 @@
+@@ -2166,6 +2978,14 @@
  
  yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
@@ -1375,6 +1431,61 @@ Changes from v14:
  # copy error log to installation now before calling cleanup function
  cp "$error_log" /target/home/"$newusername"/
  chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
+--- a/usr/bin/refractainstaller-wrapper.sh
++++ b/usr/bin/refractainstaller-wrapper.sh
+@@ -5,8 +5,42 @@
+ TEXTDOMAIN=refractainstaller-gui
+ TEXTDOMAINDIR=/usr/share/locale/
+ 
++# --- theme-aware xterm colours (best-effort; silent + never a dependency) ---
++# refracta_xterm_theme echoes xterm colour flags matching the desktop's
++# light/dark preference, or NOTHING if it can't tell (so xterm keeps its
++# built-in colours). It never errors, hangs, or requires the query tools.
++# When run as root via sudo it reads the invoking user's KDE config.
++refracta_xterm_theme() {
++	local mode="" k bg r g b s cs home="$HOME"
++	if [[ $EUID -eq 0 && -n $SUDO_USER ]]; then
++		home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
++		[[ -d $home ]] || home="$HOME"
++	fi
++	if   command -v kreadconfig6 >/dev/null 2>&1; then k=kreadconfig6
++	elif command -v kreadconfig5 >/dev/null 2>&1; then k=kreadconfig5 ; fi
++	if [[ -n $k ]]; then
++		bg=$(HOME="$home" "$k" --file kdeglobals --group 'Colors:Window' --key BackgroundNormal 2>/dev/null)
++		IFS=',' read -r r g b _ <<< "$bg"
++		if [[ $r =~ ^[0-9]+$ && $g =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]]; then
++			(( (r*299 + g*587 + b*114) / 1000 < 128 )) && mode=dark || mode=light
++		else
++			s=$(HOME="$home" "$k" --file kdeglobals --group General --key ColorScheme 2>/dev/null)
++			case "${s,,}" in *dark*) mode=dark ;; *light*) mode=light ;; esac
++		fi
++	fi
++	if [[ -z $mode ]] && command -v gsettings >/dev/null 2>&1; then
++		cs=$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)
++		case "$cs" in *prefer-dark*) mode=dark ;; *prefer-light*) mode=light ;; esac
++	fi
++	case "$mode" in
++		dark)  printf '%s' '-bg #232629 -fg #fcfcfc -cr #3daee9' ;;
++		light) printf '%s' '-bg #fcfcfc -fg #232629 -cr #3daee9' ;;
++	esac
++}
++XTC="$(refracta_xterm_theme)"
++
+ if ! [[ -f /usr/bin/yad ]]; then
+-	xterm -fa mono -fs 14 -geometry 80x20+0+0 -e 'echo $"Yad is not installed. 
++	xterm $XTC -fa mono -fs 14 -geometry 80x20+0+0 -e 'echo $"Yad is not installed. 
+ Install it or run the text-only refractainstaller in a root terminal."' &
+ 	exit 0
+ fi
+@@ -16,7 +50,7 @@
+ 
+ # Start script in terminal with sudo. Most live systems have sudo nopasswd.
+ # If sudo fails, ask for root password.
+-xterm -fa mono -fs 12 -e  "echo 'If user password fails, use root password.' && sudo  $installer ||  su -c $installer"
++xterm $XTC -fa mono -fs 12 -e  "echo 'If user password fails, use root password.' && sudo  $installer ||  su -c $installer"
+ 
+ 
+ exit 0
 --- a/usr/bin/refractainstaller
 +++ b/usr/bin/refractainstaller
 @@ -28,6 +28,86 @@
