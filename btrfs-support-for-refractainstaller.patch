@@ -1,49 +1,37 @@
 From: Refracta user
-Date: 2026-07-12
-Subject: [PATCH v16] GUI installer: theme-aware xterm colours (respect KDE light/dark)
+Date: 2026-07-15
+Subject: [PATCH v18] GUI installer: custom window/dialog icon + launcher icon
 
-Building on v1-v15. Cosmetic-only: the progress terminal the GUI installer runs
-in is a plain xterm, which - unlike the yad dialogs (GTK, they follow the desktop
-theme) - has no idea about the OS light/dark setting and always renders black-on-
-white. On a dark-themed KDE Plasma / Debian 13 desktop that xterm looks out of
-place. This makes those xterms follow the desktop's light/dark preference when it
-can be determined, and otherwise leaves xterm's built-in colours alone.
+Building on v1-v17. Cosmetic-only. Three related icon changes so the installer
+stops showing yad's default green-flask logo:
 
-Nothing about the install flow changes; only xterm colours.
+  1. Window icon (titlebar / taskbar / alt-tab): a custom Refracta installer
+     icon is used for every yad dialog. It is injected centrally in the yad()
+     wrapper and ONLY when a dialog did not set its own --window-icon, so the
+     existing error/warning dialogs keep their red --window-icon=error.
+  2. Final dialog image: the "Installation complete" dialog now shows the same
+     custom icon as its in-dialog image (was gtk-dialog-info). Other dialogs'
+     info/question/error images are unchanged.
+  3. Launcher icon: usr/share/applications/refractainstaller.desktop now points
+     at the custom icon (was Icon=system, which showed as a blank page).
 
-New helper (inlined near the top of each affected script, so no new file and no
-new dependency):
+The icon is a new SVG installed to
+usr/share/icons/hicolor/scalable/apps/refractainstaller.svg and referenced by
+absolute path (via $REFRACTA_ICON in the script, and directly in the .desktop),
+so it renders regardless of icon theme/cache - important on freshly built ISOs.
 
-  refracta_xterm_theme() echoes xterm colour flags (-bg/-fg/-cr) matching the
-  desktop's light/dark mode, or NOTHING if it cannot tell - in which case xterm
-  keeps its defaults. Detection is best-effort and never fatal:
-    1. KDE window background colour (kreadconfig6/5, [Colors:Window]
-       BackgroundNormal) classified by luminance - theme-name agnostic;
-    2. KDE ColorScheme name containing dark/light as a fallback;
-    3. the XDG/GNOME color-scheme hint (gsettings prefer-dark/prefer-light).
-  Each step is skipped if its tool is absent; anything ambiguous -> no output.
-  When the installer runs as root via sudo it reads the invoking user's KDE
-  config (SUDO_USER -> getent home), so the root-context xterms (partition tool,
-  chroot) also match. The result is computed once into $XTC and each xterm call
-  becomes `xterm $XTC ...` ($XTC unquoted, so empty adds zero arguments).
-
-What changes (v16):
-
-  - refractainstaller-wrapper.sh: inline the helper; the main installer progress
-    window and the "yad not installed" message xterm become theme-aware. This
-    wrapper runs as the desktop user, so it detects the theme directly.
-  - refractainstaller-yad: inline the helper; the partition-tool xterm and the
-    chroot xterm become theme-aware (root-context, via SUDO_USER).
-  - refractainstaller (CLI) and btrfs-disk-lib.sh: unchanged from v15 (the CLI
-    is text-only and launches no xterm).
-
-Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
-#3daee9). refractainstaller-wrapper.sh is patched here for the first time.
+What changes (v18):
+  - refractainstaller-yad: define REFRACTA_ICON; set the window icon in the
+    yad() wrapper; use the custom icon as the final dialog's --image.
+  - usr/share/applications/refractainstaller.desktop: Icon=.
+  - NEW usr/share/icons/hicolor/scalable/apps/refractainstaller.svg.
+  - refractainstaller-wrapper.sh, refractainstaller (CLI) and btrfs-disk-lib.sh:
+    unchanged from v17.
 
 ---
 --- a/usr/bin/refractainstaller-yad
 +++ b/usr/bin/refractainstaller-yad
-@@ -5,6 +5,40 @@
+@@ -5,6 +5,67 @@
  TEXTDOMAIN=refractainstaller-gui
  TEXTDOMAINDIR=/usr/share/locale/
  
@@ -81,10 +69,37 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
 +}
 +XTC="$(refracta_xterm_theme)"
 +
++# --- window / dialog icon (custom) ---
++REFRACTA_ICON="/usr/share/icons/hicolor/scalable/apps/refractainstaller.svg"
++
++# --- total elapsed-time reporting (purely cosmetic) ---
++# Record when the script started so the final "all done" dialog can report how
++# long the whole run took - every dialog and copy, from launch to finish. Best-
++# effort: if the start time was never captured the sentence is simply omitted.
++REFRACTA_START_EPOCH=$(date +%s)
++refracta_plural() {  # <count> <singular-noun> -> "1 noun" or "N nouns"
++	if (( $1 == 1 )); then printf '%d %s' "$1" "$2"; else printf '%d %ss' "$1" "$2"; fi
++}
++refracta_elapsed_sentence() {
++	local t d h m s
++	[[ $REFRACTA_START_EPOCH =~ ^[0-9]+$ ]] || return 0
++	t=$(( $(date +%s) - REFRACTA_START_EPOCH ))
++	(( t > 0 )) || t=0
++	d=$(( t / 86400 ))
++	h=$(( t % 86400 / 3600 ))
++	m=$(( t % 3600 / 60 ))
++	s=$(( t % 60 ))
++	if   (( d > 0 )); then printf 'This operation took %s, %s, %s, %s.' "$(refracta_plural "$d" day)" "$(refracta_plural "$h" hour)" "$(refracta_plural "$m" minute)" "$(refracta_plural "$s" second)"
++	elif (( h > 0 )); then printf 'This operation took %s, %s, %s.' "$(refracta_plural "$h" hour)" "$(refracta_plural "$m" minute)" "$(refracta_plural "$s" second)"
++	elif (( m > 0 )); then printf 'This operation took %s, %s.' "$(refracta_plural "$m" minute)" "$(refracta_plural "$s" second)"
++	else                   printf 'This operation took %s.' "$(refracta_plural "$s" second)"
++	fi
++}
++
  
   # Copyright 2011-2021 fsmithred@gmail.com
   # Portions may be copyright Dean Linkous and/or David Hare and/or others.
-@@ -52,6 +86,86 @@
+@@ -52,6 +113,86 @@
  
  configfile="/etc/refractainstaller.conf"
  
@@ -171,7 +186,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  if [[ -f $configfile ]]; then
      source $configfile
  else
-@@ -114,6 +228,13 @@
+@@ -114,6 +255,13 @@
  # (setting it in wrapper script no longer works.)
  	set -x
  
@@ -185,7 +200,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  # Check that xserver is running and user is root.
  [[ $DISPLAY ]] || { echo $"There is no xserver running. Exiting..." ; exit 1 ; }
  if [[ $(id -u) -ne 0 ]] ; then
-@@ -130,6 +251,60 @@
+@@ -130,6 +278,62 @@
  # Record errors in a logfile.
  exec 2>"$error_log"
  echo "Version:	$version" >> "$error_log"
@@ -232,8 +247,10 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
 +	[[ -z "$_title" ]] && _title="(untitled)"
 +	local _t0=$EPOCHSECONDS
 +	printf '%s DIALOG open  kind=%-9s title=%s\n' "$(_iso_now)" "$_kind" "$_title" >> "$error_log"
++	local _wi=()
++	case " $* " in *" --window-icon="*|*" --window-icon "*) ;; *) _wi=(--window-icon="$REFRACTA_ICON") ;; esac
 +	[[ $_was == *x* ]] && set -x
-+	command yad "$@"
++	command yad "${_wi[@]}" "$@"
 +	local _rc=$?
 +	{ set +x ; } 2>/dev/null
 +	printf '%s DIALOG close kind=%-9s title=%s exit=%s duration=%ss\n' \
@@ -246,7 +263,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  #******************************************************************
  
  # Make sure yad is installed, and check the version. *** What version is really needed??? ***
-@@ -156,6 +331,42 @@
+@@ -156,6 +360,42 @@
  fi
  
  
@@ -289,7 +306,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  # Greeting window
  yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
  	--button=$"Continue":0 --button=$"Exit":1 \
-@@ -179,6 +390,134 @@
+@@ -179,6 +419,134 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -424,7 +441,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  # function to exit the script if there are errors
  check_exit () {
  exit_code="$?"
-@@ -331,6 +670,9 @@
+@@ -331,6 +699,9 @@
  "
  	fi
  
@@ -434,7 +451,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  	yad --title=$"$window_title" --width=480 --button=$"Help":0 \
  	--button=$"Continue":1 --button=$"Exit":2 --center --borders=10 \
  	--text=$"
-@@ -341,11 +683,12 @@
+@@ -341,11 +712,12 @@
  DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
  	"
  	answer="$?"
@@ -448,7 +465,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  else
  	# not uefi, do bios install.
  	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
-@@ -430,6 +773,9 @@
+@@ -430,6 +802,9 @@
  fi
  
  
@@ -458,17 +475,17 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  # Select installation options
  
  opts=$(yad --list --title=$"Installation Options" --center --borders=10 \
-@@ -557,10 +903,73 @@
+@@ -557,10 +932,73 @@
          fi
      fi
      # end test for cryptsetup
 -fi    
 +fi
- 
++
 +fi   # end: expert installation-options screen (skipped in automated mode)
  
+ 
 -## Partition a disk ##### 
-+
 +## Partition a disk #####
 +
 +
@@ -534,7 +551,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  
  list_disks () {
-@@ -571,6 +980,99 @@
+@@ -571,6 +1009,99 @@
  	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
  }
  
@@ -634,7 +651,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  partition_disk () {
  if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
  	cli_partition_tool="gdisk"
-@@ -578,20 +1080,31 @@
+@@ -578,20 +1109,31 @@
  	cli_partition_tool="cfdisk"
  fi
  
@@ -671,7 +688,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  }
  
-@@ -611,8 +1124,16 @@
+@@ -611,8 +1153,16 @@
  fi
  
  
@@ -690,7 +707,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  ask_format_efi () {
  
-@@ -778,7 +1299,7 @@
+@@ -778,7 +1328,7 @@
  boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
  }
  
@@ -699,7 +716,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
      choose_boot
  fi
  
-@@ -845,16 +1366,20 @@
+@@ -845,16 +1395,20 @@
  fi
  }
  
@@ -723,7 +740,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +1392,48 @@
+@@ -867,10 +1421,48 @@
  fi  
  }
  
@@ -773,7 +790,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  fi
  
  
-@@ -977,6 +1540,158 @@
+@@ -977,6 +1569,158 @@
  
  
  
@@ -932,7 +949,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  # Show a summary of what will be done
  
  if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
-@@ -1251,9 +1966,49 @@
+@@ -1251,9 +1995,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -984,7 +1001,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +2088,70 @@
+@@ -1333,14 +2117,70 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -1058,7 +1075,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  fi
  
  
-@@ -1372,6 +2183,16 @@
+@@ -1372,6 +2212,16 @@
          sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
      fi
  
@@ -1075,7 +1092,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
-@@ -1447,6 +2268,16 @@
+@@ -1447,6 +2297,16 @@
          sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
      fi
  
@@ -1092,7 +1109,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
-@@ -1531,9 +2362,23 @@
+@@ -1531,9 +2391,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -1117,7 +1134,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2439,12 @@
+@@ -1594,10 +2468,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1131,7 +1148,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  fi
  
  
-@@ -1674,13 +2521,28 @@
+@@ -1674,13 +2550,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -1163,7 +1180,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  fi
  
  
-@@ -1690,13 +2552,57 @@
+@@ -1690,13 +2581,57 @@
  
  
   
@@ -1224,7 +1241,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  fi
  
  
-@@ -1765,7 +2671,7 @@
+@@ -1765,7 +2700,7 @@
  
  chroot_terminal () {
  
@@ -1233,7 +1250,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  }
  
-@@ -1793,6 +2699,10 @@
+@@ -1793,6 +2728,10 @@
  fi
  
  # Pause to allow manual changes to /target for UEFI boot.
@@ -1244,7 +1261,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
  	--text=$"${bios_boot_warning}
  ${grub_message}
-@@ -1808,6 +2718,7 @@
+@@ -1808,6 +2747,7 @@
  " \
  "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
  answer="$?"
@@ -1252,7 +1269,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  if [[ $answer = 1 ]] ; then
  	chroot_terminal
-@@ -1836,7 +2747,8 @@
+@@ -1836,7 +2776,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -1262,12 +1279,13 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1874,60 +2786,17 @@
+@@ -1874,60 +2815,17 @@
  oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
  old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
  
 -username_dialog() {
--
++# hostname/username collected up front (v13); nothing to ask here.
+ 
 -	newuser=$(yad --form --title=$"Configure hostname and username..." --center --borders=10 --button=$"OK":0 \
 -	--text=$"\n You should change the hostname and username \n \
 -	(optional but recommended) \n" \
@@ -1278,7 +1296,6 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
 -	--field=$"Use sudo as default for new user\? (and disable root account)":CHK \
 -	--field=$"Use sudo only for shutdown\? (and keep root account)":CHK \
 -	"$HOSTNAME" "$oldname" "$old_realname" FALSE FALSE FALSE)
-+# hostname/username collected up front (v13); nothing to ask here.
  
 -	new_hostname=$(echo $newuser |awk -F "|" '{print $1}')
 -	newname=$(echo $newuser |awk -F "|" '{print $2}')
@@ -1287,7 +1304,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
 -	sudo_is_default=$(echo $newuser |awk -F "|" '{print $5}')
 -	sudo_shutdown=$(echo $newuser |awk -F "|" '{print $6}')
 -}
- 
+-
 -username_dialog
  
 -
@@ -1327,7 +1344,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
  	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
  fi
-@@ -2053,72 +2922,15 @@
+@@ -2053,72 +2951,15 @@
  
  ## passwords ##
  
@@ -1405,7 +1422,7 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  
  	if [ -n "$newpass" ]; then
-@@ -2133,8 +2945,8 @@
+@@ -2133,8 +2974,8 @@
  # do user password
  set_userpass() {
  
@@ -1416,10 +1433,14 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  
  	if [ -n "$newpass" ]; then
  		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
-@@ -2166,6 +2978,14 @@
+@@ -2164,7 +3005,16 @@
+ fi
  
- yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
  
+-yad --image=gtk-dialog-info --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n" --width=500 --button=$"OK":0
++_elapsed_msg="$(refracta_elapsed_sentence)"
++yad --image="$REFRACTA_ICON" --title="$window_title" --center --borders=10 --text=$" Installation complete. \n\n You may now reboot into the new system.\n\n Remember to remove your installation media.\n\n $_elapsed_msg\n" --width=500 --button=$"OK":0
++
 +# Stop dual logging and do final sync
 +if [[ -n "$_log_tail_pid" ]]; then
 +	kill "$_log_tail_pid" 2>/dev/null
@@ -1427,10 +1448,9 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
 +fi
 +# Final sync of error log to target
 +[[ -n "$_target_error_log" ]] && cp "$error_log" "$_target_error_log" 2>/dev/null
-+
+ 
  # copy error log to installation now before calling cleanup function
  cp "$error_log" /target/home/"$newusername"/
- chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
 --- a/usr/bin/refractainstaller-wrapper.sh
 +++ b/usr/bin/refractainstaller-wrapper.sh
 @@ -5,8 +5,42 @@
@@ -2033,6 +2053,15 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
  # copy error log to installation before calling cleanup function
  cp "$error_log" /target/home/"$newusername"/
  chown 1000:1000 /target/home/"$newusername"/"${error_log##*/}"
+--- a/usr/share/applications/refractainstaller.desktop
++++ b/usr/share/applications/refractainstaller.desktop
+@@ -6,5 +6,5 @@
+ Exec=/usr/bin/refractainstaller-wrapper.sh
+ Terminal=false
+ Type=Application
+-Icon=system
++Icon=/usr/share/icons/hicolor/scalable/apps/refractainstaller.svg
+ Categories=GNOME;GTK;System;
 --- /dev/null
 +++ b/usr/lib/refractainstaller/btrfs-disk-lib.sh
 @@ -0,0 +1,116 @@
@@ -2152,3 +2181,143 @@ Palette matches Breeze (dark #232629/#fcfcfc, light #fcfcfc/#232629, cursor
 +    echo "Done: $_disk -> p1 ESP, p2 /boot (ext4), p3 btrfs + ${#REFRACTA_BTRFS_LAYOUT[@]} subvolumes + manifest"
 +    return 0
 +}
+--- /dev/null
++++ b/usr/share/icons/hicolor/scalable/apps/refractainstaller.svg
+@@ -0,0 +1,137 @@
++<?xml version="1.0" encoding="UTF-8" standalone="no"?>
++<svg
++   viewBox="0 0 40.96 40.96"
++   width="256"
++   height="256"
++   role="img"
++   aria-label="cd-create-exchange icon"
++   fill="currentColor"
++   stroke="currentColor"
++   stroke-width="0.7"
++   stroke-linecap="round"
++   stroke-linejoin="round"
++   paint-order="stroke fill markers"
++   style="color:#dc2626;fill:currentColor;stroke:currentColor;stroke-width:0.7"
++   version="1.1"
++   id="svg3"
++   xmlns:xlink="http://www.w3.org/1999/xlink"
++   xmlns="http://www.w3.org/2000/svg"
++   xmlns:svg="http://www.w3.org/2000/svg">
++  <defs
++     id="defs3">
++    <linearGradient
++       id="linearGradient6">
++      <stop
++         style="stop-color:#000000;stop-opacity:1;"
++         offset="0"
++         id="stop7" />
++      <stop
++         style="stop-color:#000000;stop-opacity:0;"
++         offset="1"
++         id="stop8" />
++    </linearGradient>
++    <linearGradient
++       id="linearGradient5">
++      <stop
++         style="stop-color:#00b036;stop-opacity:0;"
++         offset="0"
++         id="stop5" />
++      <stop
++         style="stop-color:#f79500;stop-opacity:1;"
++         offset="1"
++         id="stop6" />
++    </linearGradient>
++    <radialGradient
++       xlink:href="#linearGradient5"
++       id="radialGradient6"
++       cx="12.0005"
++       cy="12.0005"
++       fx="12.0005"
++       fy="12.0005"
++       r="12.3505"
++       gradientTransform="matrix(1,0,0,0.99975711,0,0.00291481)"
++       gradientUnits="userSpaceOnUse" />
++    <radialGradient
++       xlink:href="#linearGradient6"
++       id="radialGradient8"
++       cx="12.0005"
++       cy="12.0005"
++       fx="12.0005"
++       fy="12.0005"
++       r="12.3505"
++       gradientTransform="matrix(1,0,0,0.99975711,0,0.00291481)"
++       gradientUnits="userSpaceOnUse" />
++  </defs>
++  <g
++     id="layer1"
++     style="display:inline"
++     transform="translate(-0.03196964,0.12794525)">
++    <g
++       id="g4"
++       style="color:#dc2626;display:inline;fill:currentColor;stroke:currentColor;stroke-width:0.7"
++       transform="matrix(1.3285039,0,0,1.3285039,0.22905128,0.51824451)">
++      <path
++         d="m 14,2 a 12,12 0 0 0 0,24 v -2 a 10,10 0 1 1 10,-10 8.27,8.27 0 0 1 0,1 h 2 c 0,-0.33 0.05,-0.66 0.05,-1 A 12,12 0 0 0 14,2 Z"
++         fill="currentColor"
++         id="path1" />
++    </g>
++  </g>
++  <g
++     id="layer4"
++     style="display:inline">
++    <path
++       id="path8"
++       style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:0.10864;stroke-opacity:1"
++       d="m 18.804688,3.753125 a 15.52,15.52 0 0 0 -15.5200005,15.52 15.52,15.52 0 0 0 15.5200005,15.52 15.52,15.52 0 0 0 15.52,-15.52 15.52,15.52 0 0 0 -15.52,-15.52 z m -0.05187,14.5975 a 0.80000001,0.80000001 0 0 1 0.8,0.8 0.80000001,0.80000001 0 0 1 -0.8,0.8 0.80000001,0.80000001 0 0 1 -0.8,-0.8 0.80000001,0.80000001 0 0 1 0.8,-0.8 z" />
++  </g>
++  <g
++     id="layer2"
++     style="display:inline;opacity:1;mix-blend-mode:normal">
++    <g
++       id="g2"
++       style="color:#475569;fill:currentColor;stroke:currentColor;stroke-width:0.7"
++       transform="matrix(1.2914214,0,0,1.2911437,3.2259403,3.7014942)">
++      <path
++         id="path1-3"
++         style="display:inline;fill:url(#radialGradient6);stroke:url(#radialGradient8)"
++         d="M 11.995017,0.0029573 C 5.4100178,0.0129573 0.07199783,5.3101066 -2.1681536e-6,11.885107 v 0.114966 C 0.00250799,15.302817 1.368402,18.45801 3.7749082,20.720055 L 4.9598912,19.43994 C 2.905989,17.503144 1.7418296,14.804985 1.7420222,11.98192 v -7.26e-4 -2.42e-4 C 1.74255,6.3133978 6.3523297,1.7039686 12.018006,1.7039686 c 1.824,0 3.536986,0.4801462 5.024986,1.3171462 L 17.857018,1.5330929 C 16.125433,0.55785041 14.177176,0.03180198 12.190054,0.0029573 Z m 0.02299,1.9239241 C 6.4750044,1.9248814 1.9629512,6.4369204 1.9629512,11.98192 c -1.412e-4,2.761074 1.137927,5.400093 3.1460006,7.295131 l 1.1801435,-1.276 C 4.6382342,16.434129 3.703288,14.25801 3.7030397,11.98192 c 0,-4.5859996 3.7299657,-8.3148179 8.3149663,-8.3148179 1.483,0 2.874984,0.3908707 4.081984,1.0748707 L 16.935068,3.2159517 C 15.434441,2.3699048 13.7407,1.9258689 12.018006,1.9268814 Z M 20.362009,3.4049799 19.208,4.6449174 c 1.975731,1.9297803 3.089108,4.5751984 3.087925,7.3370026 0,5.666 -4.609983,10.276016 -10.275983,10.276016 -1.783,0 -3.4599028,-0.455848 -4.9219028,-1.257848 l -0.8539525,1.521906 c 1.7637963,0.968771 3.7436765,1.47644 5.7560123,1.47592 6.626,0 12.000827,-5.37302 12.000827,-12.00002 -0.0015,-3.2382635 -1.313781,-6.3380094 -3.637949,-8.5929141 z m -8.343035,0.4830988 c -4.4610008,0 -8.0918595,3.6298417 -8.0918595,8.0938413 0,2.301 0.966913,4.382179 2.514913,5.858179 l 1.172884,-1.270192 C 6.3620831,15.37268 5.6539089,13.714816 5.6551039,11.98192 5.6583961,8.4685906 8.5056447,5.6212714 12.018974,5.617892 c 1.10305,-0.0017 2.187215,0.2862334 3.144064,0.8350154 L 15.993035,4.9360836 C 14.781167,4.2492038 13.411966,3.8881301 12.018974,3.8880787 Z m 7.03803,0.9209374 -1.183048,1.2740642 c 1.576405,1.557813 2.462492,3.6825752 2.459984,5.8988397 h -9.68e-4 c 0,4.586 -3.729966,8.31506 -8.314966,8.31506 -1.383776,5.32e-4 -2.745727,-0.344917 -3.9619623,-1.004923 l -0.8520166,1.515856 c 1.4757144,0.808135 3.1314769,1.230864 4.8139789,1.229046 5.543,0 10.055054,-4.512039 10.055054,-10.055039 0,-2.8079996 -1.157056,-5.3469039 -3.016056,-7.1729039 z M 12.01607,5.8410468 c -3.3840004,-0.005 -6.141005,2.7528736 -6.141005,6.1408732 -0.00115,1.670911 0.6809326,3.269641 1.8879392,4.425098 l 1.1569132,-1.250103 0.014035,0.01404 C 8.067682,14.33716 7.5784684,13.186444 7.5790983,11.984099 7.5784352,9.5333156 9.5652866,7.5463619 12.01607,7.5468988 c 0.778921,-3.973e-4 1.543987,0.205986 2.217034,0.5980647 L 15.052937,6.6470183 C 14.128392,6.1177918 13.08137,5.8399167 12.01607,5.8410468 Z m 5.710036,0.4010495 -1.179176,1.2668032 c 1.178122,1.1906613 1.838977,2.7980135 1.839059,4.4730205 -0.0033,3.513801 -2.851278,6.361316 -6.36508,6.364028 -1.049276,0.0023 -2.0825087,-0.257526 -3.0058929,-0.75587 l -0.8479029,1.5069 c 1.182545,0.643182 2.5076558,0.979151 3.8537958,0.97709 4.464,0 8.095005,-3.630084 8.095005,-8.094084 0.0015,-2.1549956 -0.859041,-4.2210615 -2.389808,-5.7378877 z m -1.332108,1.43187 -1.161995,1.250103 c 0.785819,0.8240981 1.224125,1.9191457 1.223942,3.0578507 h 9.68e-4 c -0.0015,2.450246 -1.987693,4.436063 -4.437939,4.4372 -0.718252,0.001 -1.425832,-0.173822 -2.0609563,-0.509238 l -0.8350779,1.488021 c 0.8902072,0.478527 1.8853642,0.728368 2.8960342,0.727069 3.391083,-0.0039 6.139111,-2.751969 6.14294,-6.143052 0.0014,-1.612841 -0.633982,-3.1610227 -1.767916,-4.3079537 z M 12.016554,8.5815919 C 10.138551,8.5815558 8.6160836,10.103917 8.6159887,11.98192 h 9.679e-4 c 0,4.53344 6.8001624,4.53344 6.8001624,0 -9.5e-5,-1.878003 -1.522562,-3.400364 -3.400565,-3.4003281 z m -0.460491,0.180557 c 1.960554,-0.2818334 3.715788,1.2390631 3.715867,3.2197711 -0.0017,1.79608 -1.457843,3.251369 -3.253924,3.251962 -1.795097,-0.0022 -3.2497639,-1.456865 -3.2519888,-3.251962 5.84e-5,-1.617696 1.1888164,-2.989547 2.7900458,-3.2197711 z m 0.459281,2.0810041 c -0.615825,0 -1.115051,0.499332 -1.115051,1.11529 0,0.615958 0.499226,1.11529 1.115051,1.11529 0.615825,0 1.11505,-0.499332 1.11505,-1.11529 0,-0.615958 -0.499225,-1.11529 -1.11505,-1.11529 z" />
++    </g>
++  </g>
++  <g
++     id="layer5"
++     style="display:inline">
++    <g
++       id="g5"
++       style="color:#dc2626;display:inline;fill:#dc4226;fill-opacity:0.428814;stroke:none;stroke-width:0.7"
++       transform="matrix(1.3285039,0,0,1.3285039,0.1491149,0.5982349)">
++      <path
++         d="m 14,20 a 6,6 0 1 1 6,-6 6,6 0 0 1 -6,6 z m 0,-10 a 4,4 0 1 0 4,4 4,4 0 0 0 -4,-4 z"
++         fill="currentColor"
++         id="path3"
++         style="fill:#dc4226;fill-opacity:0.428814;stroke:none" />
++    </g>
++  </g>
++  <g
++     id="layer3">
++    <g
++       id="g3"
++       style="color:#dc2626;display:none;fill:#818181;fill-opacity:1;stroke:#ffffff;stroke-width:1.20436;stroke-dasharray:none;stroke-opacity:1"
++       transform="matrix(-1.3285039,0,0,1.3285039,62.348701,0.51824451)">
++      <path
++         d="m 17,24 h 9.17 L 23.58,26.59 25,28 30,23 25,18 23.58,19.42 26.17,22 H 17 Z"
++         fill="currentColor"
++         id="path2"
++         style="fill:#818181;fill-opacity:1;stroke:#ffffff;stroke-width:1.20436;stroke-dasharray:none;stroke-opacity:1" />
++    </g>
++    <g
++       id="g6"
++       style="color:#dc2626;display:inline;fill:#818181;fill-opacity:1;stroke:#ffffff;stroke-width:1.20436;stroke-dasharray:none;stroke-opacity:1"
++       transform="matrix(1.3285039,0,0,1.3285039,-0.09094872,0.51824451)">
++      <path
++         d="m 17,24 h 9.17 L 23.58,26.59 25,28 30,23 25,18 23.58,19.42 26.17,22 H 17 Z"
++         fill="currentColor"
++         id="path4"
++         style="fill:#818181;fill-opacity:1;stroke:#ffffff;stroke-width:1.20436;stroke-dasharray:none;stroke-opacity:1" />
++    </g>
++  </g>
++</svg>

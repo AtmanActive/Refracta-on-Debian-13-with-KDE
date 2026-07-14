@@ -66,7 +66,7 @@ A one-time, idempotent setup script (safe to re-run, each step checks state and 
 **Preparation Step 2: Apply the patches.**
 
 ```bash
-# btrfs support for refractainstaller (v9.6.6 → v9.6.6.16)
+# btrfs support for refractainstaller (v9.6.6 → v9.6.6.18)
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 
 # default "seed /etc/skel + UEFI" snapshot mode for refractasnapshot
@@ -77,14 +77,14 @@ Two standard unified diffs.
 
 <details>
 
-**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, (v15) the same SDDM autologin fix ported to the CLI installer, and (v16) theme-aware colours for the progress xterm so it follows the desktop's light/dark mode instead of always being black-on-white.
+**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, (v15) the same SDDM autologin fix ported to the CLI installer, (v16) theme-aware colours for the progress xterm so it follows the desktop's light/dark mode instead of always being black-on-white, (v17) a total-elapsed-time line on the final "Installation complete" dialog reporting how long the whole run took, and (v18) a custom window/dialog/launcher icon in place of yad's default green-flask logo.
 
-**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below); **(v2)** it also gives the snapshot's progress xterm the same theme-aware colours as the installer's v16, and patches `refractasnapshot-wrapper.sh` for that.
+**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below); **(v2)** it also gives the snapshot's progress xterm the same theme-aware colours as the installer's v16, and patches `refractasnapshot-wrapper.sh` for that; **(v3)** it adds a total-elapsed-time line to the final "All finished!" dialog reporting how long the whole snapshot run took; **(v4)** it replaces yad's default green-flask logo with a custom window/dialog/launcher icon.
 
 See the [Developers](#developers) section for the full version history.
 </details>
 
-Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.16/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.2/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable. Both builds now also include the `*-wrapper.sh` launchers.
+Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.18/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.4/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable. Both builds also include the `*-wrapper.sh` launchers and, from v18/v4, the custom `*.svg` icon (→ `/usr/share/icons/hicolor/scalable/apps/`) and the patched `*.desktop` launcher (→ `/usr/share/applications/`). The `update_installed_*.sh` scripts install all of these and refresh the icon/desktop caches.
 
 ## Usage (every time you want to pack an ISO)
 
@@ -207,10 +207,10 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 | `btrfs-support-for-refractainstaller.patch` | The patch. Applied against the **pristine** 9.6.6 scripts (not the installed copies, which can be stale). Patches `refractainstaller-yad` + `refractainstaller` and creates the shared library. |
 | `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
 | `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
-| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.16/`), including `btrfs-disk-lib.sh` and (from v16) `refractainstaller-wrapper.sh`. |
+| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.18/`), including `btrfs-disk-lib.sh`, (from v16) `refractainstaller-wrapper.sh`, and (from v18) `refractainstaller.svg` + `refractainstaller.desktop`. |
 | `skel-seed-for-refractasnapshot.patch` | The patch that folds `/etc/skel` seeding into refractasnapshot. Applied against the **pristine** 10.4.3/10.4.1 scripts. Patches `refractasnapshot` + `refractasnapshot-gui` and creates the shared library. |
 | `skel-seed-lib.sh` | **Single source of truth** for `/etc/skel` seeding. Defines the dotfile / config / app-data arrays and the copy logic. The patch installs it to `/usr/lib/refractasnapshot/skel-seed-lib.sh`; the standalone seed script sources it (falling back to a copy beside itself). Edit the arrays here and the snapshot tools + the standalone script all follow. |
-| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.2/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh` and (from v2) `refractasnapshot-wrapper.sh`. |
+| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.4/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`, (from v2) `refractasnapshot-wrapper.sh`, and (from v4) `refractasnapshot.svg` + `refractasnapshot.desktop`. |
 | `install_and_prepare_refracta_on_debian13.sh` | Source-machine setup (see Usage). |
 | `refracta_seed_home_environment_before_iso_creation.sh` | Standalone `/etc/skel` seeder — now a thin CLI wrapper around `skel-seed-lib.sh` (the snapshot tools' default mode does the same thing). |
 
@@ -505,6 +505,34 @@ v16 (installer) and the parallel **snapshot v2** make those xterms follow the de
 - When a tool runs the terminal as root (the GUIs are launched via `sudo`/`su`), the helper reads the invoking user's KDE config (`SUDO_USER` → `getent` home), so the root-context xterms (partition tool, chroot, the snapshot GUI) also match.
 
 Colours match Breeze (dark `#232629`/`#fcfcfc`, light reversed, cursor `#3daee9`). Cosmetic only — no install or snapshot behaviour changes. This is the first time `refractainstaller-wrapper.sh` and `refractasnapshot-wrapper.sh` are patched. (CLI installer, `btrfs-disk-lib.sh`, snapshot CLI and `skel-seed-lib.sh` are all unchanged.)
+
+</details>
+
+<details>
+<summary><b>v17 — total elapsed time on the final dialog (also snapshot v3)</b></summary>
+
+Purely cosmetic. The final dialog — the installer's "Installation complete" and the snapshot's "All finished!" — now ends with one extra sentence reporting how long the whole run took:
+
+> This operation took 2 hours, 5 minutes, 3 seconds.
+
+The clock starts the moment the GUI script itself starts (`refractainstaller-yad` / `refractasnapshot-gui`) and runs until that final dialog, so it covers **everything** — every question dialog, the disk/copy/squashfs/iso work, all of it. The most-significant zero units are dropped, so a quick run just reads `This operation took 42 seconds.` and a longer one `This operation took 8 minutes, 12 seconds.`; a full `days, hours, minutes, seconds` only appears once it actually runs for a day or more. Units are singular when the count is exactly one — `This operation took 1 hour, 1 minute, 1 second.`, not `1 hours, 1 minutes, 1 seconds`.
+
+- A tiny helper is inlined near the top of each GUI script: `REFRACTA_START_EPOCH=$(date +%s)` captures the start, and `refracta_elapsed_sentence()` formats the difference at the end. No new file, no new dependency.
+- Best-effort, like the v16 xterm colours: if the start time is ever unavailable the sentence is simply omitted, so the dialog is never broken.
+- Only the two GUI scripts change (v17 = `refractainstaller-yad`; v3 = `refractasnapshot-gui`). The wrappers, both CLIs, and both shared libraries are byte-identical to v16 / v2.
+
+</details>
+
+<details>
+<summary><b>v18 — custom window/dialog/launcher icon (also snapshot v4)</b></summary>
+
+By default every yad dialog shows yad's own logo — a **green potion/flask bottle** — in the titlebar, taskbar and alt-tab, and the KDE launchers showed a blank page (`Icon=system`). v18 (installer) and **snapshot v4** replace all of that with a custom per-tool icon (`refractainstaller.svg` / `refractasnapshot.svg`), in three places:
+
+1. **Window icon** — set for every dialog. On the installer it's injected centrally in the `yad()` wrapper, and *only* when the dialog didn't set its own `--window-icon`, so the red error/warning dialogs keep their error icon. On the snapshot it's set in the `DIALOG="yad …"` definition (plus the standalone "Snapshot Help" dialog).
+2. **Final dialog image** — the "Installation complete" / "All finished!" dialog now shows the custom icon as its in-body image (previously the `gtk-dialog-info` light bulb). All other dialogs keep their info/question/error images.
+3. **Launcher icon** — `refractainstaller.desktop` / `refractasnapshot.desktop` now point `Icon=` at the custom icon.
+
+The icon is a new SVG installed to `/usr/share/icons/hicolor/scalable/apps/`, referenced by **absolute path** (via `$REFRACTA_ICON` in the script, and directly in the `.desktop`), so it renders regardless of icon theme or cache state — important on a freshly built ISO. Because the snapshot rsyncs the live system into the ISO, the icon and patched launcher ride along into installs/ISOs automatically. Cosmetic only; the wrappers, both CLIs and both shared libraries are unchanged from v17/v3. *(The final-dialog image renders at the SVG's native size; if it looks too large it can be capped.)*
 
 </details>
 
