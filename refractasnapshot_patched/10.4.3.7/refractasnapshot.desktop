@@ -1,0 +1,9 @@
+[Desktop Entry]
+Encoding=UTF-8
+Name=Refracta Snapshot
+Comment= Create a live CD snapshot of your system.
+Exec=/usr/bin/refractasnapshot-wrapper.sh
+Terminal=false
+Type=Application
+Icon=/usr/share/icons/hicolor/scalable/apps/refractasnapshot.svg
+Categories=GNOME;GTK;System;

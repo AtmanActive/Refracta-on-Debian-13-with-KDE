@@ -1,37 +1,42 @@
 From: Refracta user
 Date: 2026-07-15
-Subject: [PATCH v18] GUI installer: custom window/dialog icon + launcher icon
+Subject: [PATCH v19] GUI installer: turning-cog "please wait, working..." dialog (replaces the 0% bar)
 
-Building on v1-v17. Cosmetic-only. Three related icon changes so the installer
-stops showing yad's default green-flask logo:
+Building on v1..v18. This v19 is cosmetic-only: the long steps (the rsync copies
+to /target, /home and /boot, the swap-file creation, and cleanup) no longer show
+a pulsating yad progress bar stuck at "0%" (the real work runs in the
+background, so the percentage was always meaningless and looked broken). Instead
+they show a small dialog with an animated turning cog and a plain "Please wait,
+working..." message - the same treatment as refractasnapshot v6-v8.
 
-  1. Window icon (titlebar / taskbar / alt-tab): a custom Refracta installer
-     icon is used for every yad dialog. It is injected centrally in the yad()
-     wrapper and ONLY when a dialog did not set its own --window-icon, so the
-     existing error/warning dialogs keep their red --window-icon=error.
-  2. Final dialog image: the "Installation complete" dialog now shows the same
-     custom icon as its in-dialog image (was gtk-dialog-info). Other dialogs'
-     info/question/error images are unchanged.
-  3. Launcher icon: usr/share/applications/refractainstaller.desktop now points
-     at the custom icon (was Icon=system, which showed as a blank page).
+  refractainstaller-yad: a working_start "<label>" / working_stop helper pair
+    opens a backgrounded yad --picture dialog (animated cog) and closes it when
+    the step finishes. It replaces the `cmd | tee >(yad --progress --pulsate)`
+    idiom in all five long steps. It calls `command yad` directly (bypassing the
+    v11 yad() logging wrapper) so $! is the real yad PID and working_stop can
+    kill it cleanly; it adds --window-icon explicitly and writes its own
+    WORKING open/close lines to the install log.
 
-The icon is a new SVG installed to
-usr/share/icons/hicolor/scalable/apps/refractainstaller.svg and referenced by
-absolute path (via $REFRACTA_ICON in the script, and directly in the .desktop),
-so it renders regardless of icon theme/cache - important on freshly built ISOs.
+The cog is an animated GIF installed to /usr/share/refractainstaller/spinner.gif,
+referenced by absolute path. NOTE: yad only ANIMATES a GIF in its --picture
+dialog (its --image shows a single static frame), and a GIF is binary while this
+patch is a plain unified diff applied with `patch -p1`, which cannot carry
+binary files. spinner.gif therefore ships as a build-dir asset installed
+separately (the update_installed_refractainstaller.sh deploy script, and the
+"copy the pre-patched binaries" path, both install it). If it is absent,
+working_start falls back to a text-only dialog.
 
-What changes (v18):
-  - refractainstaller-yad: define REFRACTA_ICON; set the window icon in the
-    yad() wrapper; use the custom icon as the final dialog's --image.
-  - usr/share/applications/refractainstaller.desktop: Icon=.
-  - NEW usr/share/icons/hicolor/scalable/apps/refractainstaller.svg.
-  - refractainstaller-wrapper.sh, refractainstaller (CLI) and btrfs-disk-lib.sh:
-    unchanged from v17.
+What changes (v19):
+  - refractainstaller-yad: define REFRACTA_SPINNER + working_start/working_stop;
+    replace the five pulsate progress dialogs with the spinner dialog.
+  - NEW (binary, NOT in this patch) usr/share/refractainstaller/spinner.gif.
+  - refractainstaller-wrapper.sh, refractainstaller (CLI), btrfs-disk-lib.sh,
+    refractainstaller.desktop and refractainstaller.svg: unchanged from v18.
 
 ---
 --- a/usr/bin/refractainstaller-yad
 +++ b/usr/bin/refractainstaller-yad
-@@ -5,6 +5,67 @@
+@@ -5,6 +5,110 @@
  TEXTDOMAIN=refractainstaller-gui
  TEXTDOMAINDIR=/usr/share/locale/
  
@@ -72,6 +77,49 @@ What changes (v18):
 +# --- window / dialog icon (custom) ---
 +REFRACTA_ICON="/usr/share/icons/hicolor/scalable/apps/refractainstaller.svg"
 +
++# --- "please wait, working..." dialog with a turning cog ----------------------
++# Long steps (the rsync copies to /target, swap-file creation, cleanup) used to
++# show a pulsating yad progress bar stuck at "0%" - the real work runs in the
++# background, so the percentage was always meaningless and looked broken.
++# Instead we show a small dialog with an animated turning cog and a plain
++# "Please wait, working..." message. working_start opens it in the background;
++# working_stop closes it.
++#
++# NOTES:
++#  * yad only ANIMATES a GIF in its --picture dialog; its --image shows a single
++#    static frame. So the cog uses --picture (which still renders --text above
++#    the picture). --size=orig keeps the cog at its native size.
++#  * We call `command yad` directly (bypassing the yad() logging wrapper) so $!
++#    is the real yad PID and working_stop can kill it cleanly; --window-icon is
++#    added explicitly, and we write our own open/close lines to the log.
++#  * Best-effort: if the spinner image is missing yad just shows the text, and
++#    working_stop with no prior start is a harmless no-op.
++REFRACTA_SPINNER="/usr/share/refractainstaller/spinner.gif"
++REFRACTA_WORK_PID=""
++working_start () {  # $1 = step label (shown in the title bar)
++	[[ -n "$error_log" ]] && printf '%s WORKING open  title=%s\n' "$(_iso_now)" "$1" >> "$error_log" 2>/dev/null
++	if [ -f "$REFRACTA_SPINNER" ] ; then
++		command yad --window-icon="$REFRACTA_ICON" --picture --filename="$REFRACTA_SPINNER" --size=orig \
++			--title="$1" --center --text-align=center \
++			--text=$"\nPlease wait, working...\n" \
++			--no-buttons --skip-taskbar --width=360 &
++	else
++		command yad --window-icon="$REFRACTA_ICON" \
++			--title="$1" --center --text-align=center \
++			--text=$"\nPlease wait, working...\n" \
++			--no-buttons --skip-taskbar --width=360 &
++	fi
++	REFRACTA_WORK_PID=$!
++}
++working_stop () {
++	if [ -n "$REFRACTA_WORK_PID" ] ; then
++		kill "$REFRACTA_WORK_PID" 2>/dev/null || true
++		wait "$REFRACTA_WORK_PID" 2>/dev/null || true
++		REFRACTA_WORK_PID=""
++	fi
++	[[ -n "$error_log" ]] && printf '%s WORKING close\n' "$(_iso_now)" >> "$error_log" 2>/dev/null
++}
++
 +# --- total elapsed-time reporting (purely cosmetic) ---
 +# Record when the script started so the final "all done" dialog can report how
 +# long the whole run took - every dialog and copy, from launch to finish. Best-
@@ -99,7 +147,7 @@ What changes (v18):
  
   # Copyright 2011-2021 fsmithred@gmail.com
   # Portions may be copyright Dean Linkous and/or David Hare and/or others.
-@@ -52,6 +113,86 @@
+@@ -52,6 +156,86 @@
  
  configfile="/etc/refractainstaller.conf"
  
@@ -186,7 +234,7 @@ What changes (v18):
  if [[ -f $configfile ]]; then
      source $configfile
  else
-@@ -114,6 +255,13 @@
+@@ -114,6 +298,13 @@
  # (setting it in wrapper script no longer works.)
  	set -x
  
@@ -200,7 +248,7 @@ What changes (v18):
  # Check that xserver is running and user is root.
  [[ $DISPLAY ]] || { echo $"There is no xserver running. Exiting..." ; exit 1 ; }
  if [[ $(id -u) -ne 0 ]] ; then
-@@ -130,6 +278,62 @@
+@@ -130,6 +321,62 @@
  # Record errors in a logfile.
  exec 2>"$error_log"
  echo "Version:	$version" >> "$error_log"
@@ -263,7 +311,7 @@ What changes (v18):
  #******************************************************************
  
  # Make sure yad is installed, and check the version. *** What version is really needed??? ***
-@@ -156,6 +360,42 @@
+@@ -156,6 +403,42 @@
  fi
  
  
@@ -306,7 +354,7 @@ What changes (v18):
  # Greeting window
  yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
  	--button=$"Continue":0 --button=$"Exit":1 \
-@@ -179,6 +419,134 @@
+@@ -179,6 +462,134 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -441,7 +489,7 @@ What changes (v18):
  # function to exit the script if there are errors
  check_exit () {
  exit_code="$?"
-@@ -331,6 +699,9 @@
+@@ -331,6 +742,9 @@
  "
  	fi
  
@@ -451,7 +499,7 @@ What changes (v18):
  	yad --title=$"$window_title" --width=480 --button=$"Help":0 \
  	--button=$"Continue":1 --button=$"Exit":2 --center --borders=10 \
  	--text=$"
-@@ -341,11 +712,12 @@
+@@ -341,11 +755,12 @@
  DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
  	"
  	answer="$?"
@@ -465,7 +513,7 @@ What changes (v18):
  else
  	# not uefi, do bios install.
  	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
-@@ -430,6 +802,9 @@
+@@ -430,6 +845,9 @@
  fi
  
  
@@ -475,7 +523,7 @@ What changes (v18):
  # Select installation options
  
  opts=$(yad --list --title=$"Installation Options" --center --borders=10 \
-@@ -557,10 +932,73 @@
+@@ -557,10 +975,73 @@
          fi
      fi
      # end test for cryptsetup
@@ -483,11 +531,11 @@ What changes (v18):
 +fi
 +
 +fi   # end: expert installation-options screen (skipped in automated mode)
++
  
++## Partition a disk #####
  
 -## Partition a disk ##### 
-+## Partition a disk #####
-+
 +
 +# Explain the manifest-driven btrfs subvolume install flow and show an example.
 +show_btrfs_manifest () {
@@ -551,7 +599,7 @@ What changes (v18):
  
  
  list_disks () {
-@@ -571,6 +1009,99 @@
+@@ -571,6 +1052,99 @@
  	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
  }
  
@@ -651,7 +699,7 @@ What changes (v18):
  partition_disk () {
  if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
  	cli_partition_tool="gdisk"
-@@ -578,20 +1109,31 @@
+@@ -578,20 +1152,31 @@
  	cli_partition_tool="cfdisk"
  fi
  
@@ -688,7 +736,7 @@ What changes (v18):
  
  }
  
-@@ -611,8 +1153,16 @@
+@@ -611,8 +1196,16 @@
  fi
  
  
@@ -707,7 +755,7 @@ What changes (v18):
  
  ask_format_efi () {
  
-@@ -778,7 +1328,7 @@
+@@ -778,7 +1371,7 @@
  boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
  }
  
@@ -716,7 +764,7 @@ What changes (v18):
      choose_boot
  fi
  
-@@ -845,16 +1395,20 @@
+@@ -845,16 +1438,20 @@
  fi
  }
  
@@ -740,7 +788,7 @@ What changes (v18):
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +1421,48 @@
+@@ -867,10 +1464,48 @@
  fi  
  }
  
@@ -790,7 +838,7 @@ What changes (v18):
  fi
  
  
-@@ -977,6 +1569,158 @@
+@@ -977,6 +1612,158 @@
  
  
  
@@ -949,7 +997,18 @@ What changes (v18):
  # Show a summary of what will be done
  
  if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
-@@ -1251,9 +1995,49 @@
+@@ -1162,7 +1949,9 @@
+ fi
+ }
+ 
+-cleanup | tee >(yad --progress --pulsate --width=350 --auto-close --title=$"Cleanup")
++working_start $"Cleanup"
++cleanup
++working_stop
+ 
+ 
+ # Write random data or zeros to OS and /home partitions
+@@ -1251,9 +2040,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -1001,7 +1060,37 @@ What changes (v18):
  
  
  # make mount point for separate home if needed
-@@ -1333,14 +2117,70 @@
+@@ -1296,20 +2125,23 @@
+ 
+ 
+ # copy everything over except the things listed in the exclude list
+-rsync -av / /target/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$rsync_excludes" ${sep_home_opt} ${sep_boot_opt} | \
+-tee >(yad --progress --pulsate --width=350 --auto-close --title=$"Copying system to new partition.")
++working_start $"Copying system to new partition."
++rsync -av / /target/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$rsync_excludes" ${sep_home_opt} ${sep_boot_opt}
++working_stop
+ 
+ 
+ # copy separate /home if needed
+ if [[ -n $home_dev ]] ; then   #&& [[ -z $keep_old_home ]] ; then
+-    rsync -av /home/ /target_home/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$home_boot_excludes" | \
+-tee >(yad --progress --pulsate --width=350 --auto-close --title=$"Copying home folders to new partition.")
++    working_start $"Copying home folders to new partition."
++    rsync -av /home/ /target_home/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$home_boot_excludes"
++    working_stop
+ fi
+ 
+ # copy separate /boot if needed
+ if [[ -n $boot_dev ]] ; then
+-    rsync -av /boot/ /target_boot/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$home_boot_excludes" | \
+-tee >(yad --progress --pulsate --width=350 --auto-close --title=$"Copying files to boot partition.")
++    working_start $"Copying files to boot partition."
++    rsync -av /boot/ /target_boot/ --filter='P lost+found' --filter='H lost+found' --exclude-from="$home_boot_excludes"
++    working_stop
+ fi
+ 
+ #*************************************************************
+@@ -1333,14 +2165,71 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -1020,6 +1109,9 @@ What changes (v18):
  # create swapfile
  if ! [[ $use_existing_swap = "yes" ]] ; then
 -	dd if=/dev/zero of=/target/swapfile bs="$swapfile_blocksize" count="$swapfile_count" | \
+-	tee >(yad --progress --pulsate --width=350 --auto-close --center --title=$"Making a swap file...")
+-	mkswap /target/swapfile ; check_exit 
+-	chmod 600 /target/swapfile
 +	# Default swapfile location (non-btrfs and plain btrfs).
 +	swapfile_fstab="/swapfile"
 +	swapfile_target="/target/swapfile"
@@ -1054,10 +1146,9 @@ What changes (v18):
 +		swap_bs="1M"
 +		swap_count=$(( ( (_mem_mib + 1023) / 1024 ) * 1024 ))
 +	fi
-+	dd if=/dev/zero of="$swapfile_target" bs="$swap_bs" count="$swap_count" | \
- 	tee >(yad --progress --pulsate --width=350 --auto-close --center --title=$"Making a swap file...")
--	mkswap /target/swapfile ; check_exit 
--	chmod 600 /target/swapfile
++	working_start $"Making a swap file..."
++	dd if=/dev/zero of="$swapfile_target" bs="$swap_bs" count="$swap_count"
++	working_stop
 +	chmod 600 "$swapfile_target"
 +	mkswap "$swapfile_target" ; check_exit
 +	# Hibernation (v7): the image lives in this swapfile, on the root filesystem
@@ -1075,7 +1166,7 @@ What changes (v18):
  fi
  
  
-@@ -1372,6 +2212,16 @@
+@@ -1372,6 +2261,16 @@
          sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
      fi
  
@@ -1092,7 +1183,7 @@ What changes (v18):
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
-@@ -1447,6 +2297,16 @@
+@@ -1447,6 +2346,16 @@
          sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
      fi
  
@@ -1109,7 +1200,7 @@ What changes (v18):
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
-@@ -1531,9 +2391,23 @@
+@@ -1531,9 +2440,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -1134,7 +1225,7 @@ What changes (v18):
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2468,12 @@
+@@ -1594,10 +2517,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1148,7 +1239,7 @@ What changes (v18):
  fi
  
  
-@@ -1674,13 +2550,28 @@
+@@ -1674,13 +2599,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -1180,7 +1271,7 @@ What changes (v18):
  fi
  
  
-@@ -1690,13 +2581,57 @@
+@@ -1690,13 +2630,57 @@
  
  
   
@@ -1241,7 +1332,7 @@ What changes (v18):
  fi
  
  
-@@ -1765,7 +2700,7 @@
+@@ -1765,7 +2749,7 @@
  
  chroot_terminal () {
  
@@ -1250,7 +1341,7 @@ What changes (v18):
  
  }
  
-@@ -1793,6 +2728,10 @@
+@@ -1793,6 +2777,10 @@
  fi
  
  # Pause to allow manual changes to /target for UEFI boot.
@@ -1261,7 +1352,7 @@ What changes (v18):
  df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
  	--text=$"${bios_boot_warning}
  ${grub_message}
-@@ -1808,6 +2747,7 @@
+@@ -1808,6 +2796,7 @@
  " \
  "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
  answer="$?"
@@ -1269,7 +1360,7 @@ What changes (v18):
  
  if [[ $answer = 1 ]] ; then
  	chroot_terminal
-@@ -1836,7 +2776,8 @@
+@@ -1836,7 +2825,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -1279,13 +1370,12 @@ What changes (v18):
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1874,60 +2815,17 @@
+@@ -1874,60 +2864,17 @@
  oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
  old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
  
 -username_dialog() {
-+# hostname/username collected up front (v13); nothing to ask here.
- 
+-
 -	newuser=$(yad --form --title=$"Configure hostname and username..." --center --borders=10 --button=$"OK":0 \
 -	--text=$"\n You should change the hostname and username \n \
 -	(optional but recommended) \n" \
@@ -1296,7 +1386,7 @@ What changes (v18):
 -	--field=$"Use sudo as default for new user\? (and disable root account)":CHK \
 -	--field=$"Use sudo only for shutdown\? (and keep root account)":CHK \
 -	"$HOSTNAME" "$oldname" "$old_realname" FALSE FALSE FALSE)
- 
+-
 -	new_hostname=$(echo $newuser |awk -F "|" '{print $1}')
 -	newname=$(echo $newuser |awk -F "|" '{print $2}')
 -	new_realname=$(echo $newuser |awk -F "|" '{print $3}')
@@ -1306,9 +1396,10 @@ What changes (v18):
 -}
 -
 -username_dialog
+-
++# hostname/username collected up front (v13); nothing to ask here.
  
--
--
+ 
 -# Test to make sure new_hostname is a legal hostname, let user fix it if it's not.
 -fix_hostname () {
 -	new_hostname=$(yad --entry --title=$"Change hostname" --center --borders=10 \
@@ -1319,7 +1410,7 @@ What changes (v18):
 -	--entry-text=$"$HOSTNAME" --width=500 --button=$"OK":0)
 -	test_hostname	
 -}
--
+ 
 -
 -test_hostname () {
 -  if [[ -z $new_hostname ]]; then
@@ -1344,7 +1435,7 @@ What changes (v18):
  	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
  	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
  fi
-@@ -2053,72 +2951,15 @@
+@@ -2053,72 +3000,15 @@
  
  ## passwords ##
  
@@ -1422,7 +1513,7 @@ What changes (v18):
  
  
  	if [ -n "$newpass" ]; then
-@@ -2133,8 +2974,8 @@
+@@ -2133,8 +3023,8 @@
  # do user password
  set_userpass() {
  
@@ -1433,7 +1524,7 @@ What changes (v18):
  
  	if [ -n "$newpass" ]; then
  		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
-@@ -2164,7 +3005,16 @@
+@@ -2164,7 +3054,16 @@
  fi
  
  

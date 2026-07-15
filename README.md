@@ -66,7 +66,7 @@ A one-time, idempotent setup script (safe to re-run, each step checks state and 
 **Preparation Step 2: Apply the patches.**
 
 ```bash
-# btrfs support for refractainstaller (v9.6.6 → v9.6.6.18)
+# btrfs support for refractainstaller (v9.6.6 → v9.6.6.19)
 sudo patch -p1 -d / < btrfs-support-for-refractainstaller.patch
 
 # default "seed /etc/skel + UEFI" snapshot mode for refractasnapshot
@@ -77,14 +77,14 @@ Two standard unified diffs.
 
 <details>
 
-**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, (v15) the same SDDM autologin fix ported to the CLI installer, (v16) theme-aware colours for the progress xterm so it follows the desktop's light/dark mode instead of always being black-on-white, (v17) a total-elapsed-time line on the final "Installation complete" dialog reporting how long the whole run took, and (v18) a custom window/dialog/launcher icon in place of yad's default green-flask logo.
+**`btrfs-support-for-refractainstaller.patch`** patches both installers (`/usr/bin/refractainstaller-yad` and `/usr/bin/refractainstaller`) and installs the shared library `/usr/lib/refractainstaller/btrfs-disk-lib.sh`. It adds btrfs (plain and with subvolumes) support, layout-manifest learning, RAM-sized NoCoW swap, hibernation resume, EFI boot fixes, the guided/automated disk setup, (v11) ISO-timestamped install logging with a per-dialog open/close trail, (v12) a consolidated automated flow that asks every question up front so the long copy runs unattended, (v13) the same up-front hostname/username/password collection extended to custom mode (only the bootloader dialog stays in the tail there), (v14) a fix for desktop autologin on SDDM (KDE Plasma) — the installer can finally disable it — plus an autologin question in automated mode, (v15) the same SDDM autologin fix ported to the CLI installer, (v16) theme-aware colours for the progress xterm so it follows the desktop's light/dark mode instead of always being black-on-white, (v17) a total-elapsed-time line on the final "Installation complete" dialog reporting how long the whole run took, (v18) a custom window/dialog/launcher icon in place of yad's default green-flask logo, and (v19) an animated turning-cog "Please wait, working…" dialog for the five long steps (the rsync copies to /target, /home and /boot, swap-file creation, and cleanup), replacing the pulsating bar stuck at "0%" — the same treatment as snapshot v6–v8.
 
-**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below); **(v2)** it also gives the snapshot's progress xterm the same theme-aware colours as the installer's v16, and patches `refractasnapshot-wrapper.sh` for that; **(v3)** it adds a total-elapsed-time line to the final "All finished!" dialog reporting how long the whole snapshot run took; **(v4)** it replaces yad's default green-flask logo with a custom window/dialog/launcher icon.
+**`skel-seed-for-refractasnapshot.patch`** patches both snapshot tools (`/usr/bin/refractasnapshot` and `/usr/bin/refractasnapshot-gui`) and installs the shared library `/usr/lib/refractasnapshot/skel-seed-lib.sh`. It adds a new **default** snapshot mode that seeds `/etc/skel` from your desktop and builds a UEFI ISO in one step (see below); **(v2)** it also gives the snapshot's progress xterm the same theme-aware colours as the installer's v16, and patches `refractasnapshot-wrapper.sh` for that; **(v3)** it adds a total-elapsed-time line to the final "All finished!" dialog reporting how long the whole snapshot run took; **(v4)** it replaces yad's default green-flask logo with a custom window/dialog/launcher icon; **(v5)** the launcher wrapper now prints a short welcome banner in the xterm just before the sudo/su password prompt, so the prompt no longer appears "out of the blue"; **(v6)** the long "working" steps (copying the filesystem, creating the ISO, etc.) show a turning-cog "Please wait, working…" dialog instead of a pulsating bar stuck at "0%"; **(v7)** makes that cog actually animate — yad only animates a GIF in its `--picture` dialog, not `--image`; **(v8)** shows the step name only in the title bar (dropped from the dialog body, which is now just "Please wait, working…"); **(v9)** the final "All finished!" dialog also shows "Your ISO is complete at &lt;dir&gt;" (the output directory).
 
 See the [Developers](#developers) section for the full version history.
 </details>
 
-Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.18/` → `/usr/bin/`, and the snapshot tools from `refractasnapshot_patched/10.4.3.4/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`), making the binaries executable. Both builds also include the `*-wrapper.sh` launchers and, from v18/v4, the custom `*.svg` icon (→ `/usr/share/icons/hicolor/scalable/apps/`) and the patched `*.desktop` launcher (→ `/usr/share/applications/`). The `update_installed_*.sh` scripts install all of these and refresh the icon/desktop caches.
+Alternatively, skip the `patch` commands and copy the pre-patched binaries into place: the installer from `refractainstaller_patched/9.6.6.19/` → `/usr/bin/` (plus its `btrfs-disk-lib.sh` → `/usr/lib/refractainstaller/`, and from v19 the `spinner.gif` → `/usr/share/refractainstaller/`), and the snapshot tools from `refractasnapshot_patched/10.4.3.9/` → `/usr/bin/` (plus its `skel-seed-lib.sh` → `/usr/lib/refractasnapshot/`, and from v6 the `spinner.gif` → `/usr/share/refractasnapshot/`), making the binaries executable. Both builds also include the `*-wrapper.sh` launchers (the snapshot wrapper carries the v5 welcome banner) and, from v18/v4, the custom `*.svg` icon (→ `/usr/share/icons/hicolor/scalable/apps/`) and the patched `*.desktop` launcher (→ `/usr/share/applications/`). The `update_installed_*.sh` scripts install all of these and refresh the icon/desktop caches. (Each tool's `spinner.gif` is a binary asset that the `patch -p1` file cannot carry, so it lives only in the build dir and is installed from there — see the cog notes in [Developers](#developers).)
 
 ## Usage (every time you want to pack an ISO)
 
@@ -207,10 +207,10 @@ When you then select **"Do not format"**, the installer reads the manifest and m
 | `btrfs-support-for-refractainstaller.patch` | The patch. Applied against the **pristine** 9.6.6 scripts (not the installed copies, which can be stale). Patches `refractainstaller-yad` + `refractainstaller` and creates the shared library. |
 | `btrfs-disk-lib.sh` | **Single source of truth** for the layout. Defines `REFRACTA_BTRFS_LAYOUT` (the 8-subvolume array), the manifest filename, and the functions that partition a disk, format it, create the subvolumes, and write the manifest. The patch installs it to `/usr/lib/refractainstaller/btrfs-disk-lib.sh`; the standalone subvolumes script sources it (falling back to a copy beside itself). Edit the layout here and both the installer's guided mode and the standalone script follow. |
 | `disk_setup_for_btrfs_desktop_{subvolumes,plain}.sh` | Standalone disk-prep scripts for the "Custom" path. The subvolumes one is a thin CLI wrapper around the shared library. |
-| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.18/`), including `btrfs-disk-lib.sh`, (from v16) `refractainstaller-wrapper.sh`, and (from v18) `refractainstaller.svg` + `refractainstaller.desktop`. |
+| `refractainstaller_patched/<build>/` | Archived copies of the patched binaries per build (e.g. `9.6.6.19/`), including `btrfs-disk-lib.sh`, (from v16) `refractainstaller-wrapper.sh`, (from v18) `refractainstaller.svg` + `refractainstaller.desktop`, and (from v19) the binary `spinner.gif` asset. |
 | `skel-seed-for-refractasnapshot.patch` | The patch that folds `/etc/skel` seeding into refractasnapshot. Applied against the **pristine** 10.4.3/10.4.1 scripts. Patches `refractasnapshot` + `refractasnapshot-gui` and creates the shared library. |
 | `skel-seed-lib.sh` | **Single source of truth** for `/etc/skel` seeding. Defines the dotfile / config / app-data arrays and the copy logic. The patch installs it to `/usr/lib/refractasnapshot/skel-seed-lib.sh`; the standalone seed script sources it (falling back to a copy beside itself). Edit the arrays here and the snapshot tools + the standalone script all follow. |
-| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.4/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`, (from v2) `refractasnapshot-wrapper.sh`, and (from v4) `refractasnapshot.svg` + `refractasnapshot.desktop`. |
+| `refractasnapshot_patched/<build>/` | Archived copies of the patched snapshot binaries per build (e.g. `10.4.3.9/` = base 10.4.3 + gui 10.4.1 patched), including `skel-seed-lib.sh`, (from v2) `refractasnapshot-wrapper.sh` (carries the v5 welcome banner), (from v4) `refractasnapshot.svg` + `refractasnapshot.desktop`, and (from v6) the binary `spinner.gif` asset. |
 | `install_and_prepare_refracta_on_debian13.sh` | Source-machine setup (see Usage). |
 | `refracta_seed_home_environment_before_iso_creation.sh` | Standalone `/etc/skel` seeder — now a thin CLI wrapper around `skel-seed-lib.sh` (the snapshot tools' default mode does the same thing). |
 
@@ -533,6 +533,57 @@ By default every yad dialog shows yad's own logo — a **green potion/flask bott
 3. **Launcher icon** — `refractainstaller.desktop` / `refractasnapshot.desktop` now point `Icon=` at the custom icon.
 
 The icon is a new SVG installed to `/usr/share/icons/hicolor/scalable/apps/`, referenced by **absolute path** (via `$REFRACTA_ICON` in the script, and directly in the `.desktop`), so it renders regardless of icon theme or cache state — important on a freshly built ISO. Because the snapshot rsyncs the live system into the ISO, the icon and patched launcher ride along into installs/ISOs automatically. Cosmetic only; the wrappers, both CLIs and both shared libraries are unchanged from v17/v3. *(The final-dialog image renders at the SVG's native size; if it looks too large it can be capped.)*
+
+</details>
+
+<details>
+<summary><b>v19 — turning-cog "please wait, working…" dialog (installer; same as snapshot v6–v8)</b></summary>
+
+The installer's five long steps ran `cmd | tee >(yad --progress --pulsate …)`, showing a bouncing bar **stuck at "0%"**. **v19** replaces them all with the same animated turning-cog *"Please wait, working…"* dialog introduced for the snapshot in v6–v8: the **system copy to `/target`**, the separate **`/home`** and **`/boot`** copies, the **swap-file** creation, and **cleanup**.
+
+- A `working_start "<label>"` / `working_stop` helper pair in `refractainstaller-yad` opens a backgrounded `yad --picture` dialog (yad only animates a GIF in `--picture`, not `--image`) and kills it when the step finishes. The step name shows in the title bar; the body is just "Please wait, working…".
+- It calls **`command yad`** directly, *bypassing the installer's v11 `yad()` logging wrapper*, so `$!` is the real yad PID and `working_stop` can `kill` it cleanly. `--window-icon` is added explicitly, and `working_start`/`working_stop` write their own `WORKING open`/`WORKING close` lines to the timestamped install log so the dialog trail is preserved.
+- The cog is the **same animated GIF** as the snapshot's, installed to `/usr/share/refractainstaller/spinner.gif` and referenced by absolute path. As with the snapshot, it's a build-dir binary asset installed separately (the patch can't carry binaries); if missing, `working_start` falls back to a text-only dialog.
+- `refractainstaller-yad`-only change plus the new asset (build `9.6.6.19`); the wrapper, CLI, shared library, `.desktop` and SVG are byte-identical to v18. See the **snapshot v6/v7/v8** note below for the full rationale (why `--picture`, why the GIF isn't in the patch).
+
+</details>
+
+<details>
+<summary><b>snapshot v5 — welcome banner before the password prompt</b></summary>
+
+When you launch Refracta Snapshot from the KDE menu and no GUI password agent (gksu/kdesu/…) is installed and passwordless sudo isn't configured, the launcher (`refractasnapshot-wrapper.sh`) opens an xterm and runs `sudo`/`su` — which asks for a password with no explanation. **snapshot v5** prints a short welcome banner in that xterm first, so the prompt no longer appears "out of the blue":
+
+> Welcome to Refracta Snapshot.
+>
+> This program will collect your running operating system into an ISO file ready to be deployed on the next machine.
+>
+> To continue, please enter your sudo password.
+
+- A `refracta_welcome_banner()` helper in the wrapper prints the text, then the branch `exec`s `sudo`/`su` as before (via `bash -c`, with the banner text and the target command passed through the environment).
+- The final "please enter your … password" line is **conditional**: it's shown only when a password is actually required. The sudo branch re-checks with `sudo -n true` (omitting the line if credentials are already cached), and the `su` branch says *"the root password"* instead of *"your sudo password"*.
+- Scope is only the two **xterm** branches. The GUI-dialog paths (gksu/kdesu/kdesudo/tdesu/ktsuss) show their own password dialog and the passwordless-sudo path needs no password — none of those has an xterm to print into, so they're untouched.
+- Wrapper-only change (build `10.4.3.5`); the GUI, CLI, shared library, `.desktop` and SVG are byte-identical to v4. No new file, no new dependency.
+
+</details>
+
+<details>
+<summary><b>snapshot v6 / v7 / v8 — turning-cog "please wait, working…" dialog (replaces the 0% bar)</b></summary>
+
+The long snapshot steps used to run `cmd | tee >(yad --progress --pulsate …)`, which showed a bouncing progress bar **stuck at "0%"**. The real work happens in the background, so the percentage was always meaningless and looked broken. **snapshot v6** replaces that with a small dialog showing a **turning cog** and a plain *"Please wait, working…"* message — no bar, no percentage.
+
+- A `working_start "<label>"` / `working_stop` helper pair in `refractasnapshot-gui` opens a backgrounded yad dialog and kills it when the step finishes (via the PID captured in `$!`). It's applied to **all six** long steps: **copying the filesystem, creating the ISO, cleaning, updatedb, update-initramfs, and seeding /etc/skel**. (Squashing has no dialog — it runs in the xterm.)
+- **The `--picture` fix (v7):** the cog is an **animated GIF**, but yad only animates a GIF in its **`--picture`** dialog — its `--image` (the left/top dialog image) shows a single **static** frame. v6 shipped the cog via `--image` (so it looked frozen); **v7** switches `working_start` to `--picture --filename=<cog gif> --size=orig`, which still renders `--text` above the picture, so the cog actually turns. (Confirmed empirically: `yad --picture` animates, `yad --image` does not.)
+- **Title-bar only (v8):** because the picture dialog renders `--text` above the cog, the step name showed in *both* the title bar and the body. **v8** drops it from the body — the body is just *"Please wait, working…"* and the step name (e.g. "Copying filesystem…") shows only in the title bar (`--title="$1"`).
+- The GIF lives at `/usr/share/refractasnapshot/spinner.gif`, referenced by absolute path. It's an 8-tooth Breeze-blue gear on transparency (so it reads on light **and** dark dialog themes), an 8-frame-period loop that turns seamlessly. If it's ever missing, `working_start` falls back to a text-only dialog — no cog, no error.
+- **Why the GIF isn't in the patch:** a `patch -p1` unified diff cannot carry binary files (GNU patch rejects git binary diffs). So the spinner is a build-dir asset installed separately by `update_installed_refractasnapshot.sh` (and by the "copy the pre-patched binaries" path).
+- `refractasnapshot-gui`-only changes (v6 build `10.4.3.6`, v7 build `10.4.3.7`, v8 build `10.4.3.8`); the wrapper, CLI, shared library, `.desktop`, SVG and the GIF itself are byte-identical across v5→v8. The cog is reproducible: `python3 make_refractasnapshot_spinner.py` (Pillow) regenerates `spinner.gif` byte-for-byte.
+
+</details>
+
+<details>
+<summary><b>snapshot v9 — ISO path on the final dialog</b></summary>
+
+The final "All finished!" dialog (`final_message()`) now shows an extra line: **"Your ISO is complete at &lt;dir&gt;"**, where `<dir>` is `$snapshot_dir` — the directory the ISO was written to (`xorriso … -o "$snapshot_dir"/"$filename"`), no filename. The line sits between "All finished!" and the elapsed-time sentence, and the dialog width is bumped `400 → 500` so a longer path fits. `refractasnapshot-gui`-only change (build `10.4.3.9`); everything else byte-identical to v8.
 
 </details>
 

@@ -1,36 +1,32 @@
 From: Refracta user
-Date: 2026-07-15
-Subject: [PATCH v4] refractasnapshot: seed /etc/skel + UEFI mode; theme-aware xterm; elapsed time; custom icons
+Date: 2026-07-16
+Subject: [PATCH v9] refractasnapshot: seed /etc/skel + UEFI mode; theme-aware xterm; elapsed time; custom icons; launch welcome banner; animated "working" cog dialog; ISO path on the final dialog
 
-Building on v1 (skel-seed + UEFI mode), v2 (theme-aware xterm), v3 (elapsed
-time). This v4 is cosmetic-only: custom window/dialog/launcher icons so the
-snapshot GUI stops showing yad's default green-flask logo.
+Building on v1..v8. This v9 adds one line to the final "All finished!" dialog:
+"Your ISO is complete at <dir>", where <dir> is $snapshot_dir (the directory the
+ISO was written to - no filename). The dialog width is bumped 400->500 so a
+longer path fits.
 
-  1. Window icon (titlebar / taskbar / alt-tab): a custom Refracta snapshot icon
-     is used for every yad dialog, set in the DIALOG="yad ..." definition and on
-     the standalone "Snapshot Help" dialog.
-  2. Final dialog image: final_message()'s "All finished!" dialog now shows the
-     custom icon as its in-dialog image (was gtk-dialog-info).
-  3. Launcher icon: usr/share/applications/refractasnapshot.desktop now points at
-     the custom icon (was Icon=system, a blank page).
+What changes (v9):
+  - refractasnapshot-gui: final_message()'s --text gains
+    "\n\n Your ISO is complete at $snapshot_dir" before the elapsed-time line;
+    --width 400 -> 500.
+  - spinner.gif (binary, NOT in this patch), refractasnapshot-wrapper.sh,
+    refractasnapshot (CLI), skel-seed-lib.sh, refractasnapshot.desktop and
+    refractasnapshot.svg: unchanged from v8.
 
-The icon is a new SVG installed to
-usr/share/icons/hicolor/scalable/apps/refractasnapshot.svg, referenced by
-absolute path so it renders regardless of icon theme/cache.
-
-What changes (v4):
-  - refractasnapshot-gui: define REFRACTA_ICON; set the window icon in the
-    DIALOG definition + the Help dialog; use the custom icon as final_message()'s
-    --image.
-  - usr/share/applications/refractasnapshot.desktop: Icon=.
-  - NEW usr/share/icons/hicolor/scalable/apps/refractasnapshot.svg.
-  - refractasnapshot-wrapper.sh, refractasnapshot (CLI) and skel-seed-lib.sh:
-    unchanged from v3.
+The cog is still an animated GIF at /usr/share/refractasnapshot/spinner.gif,
+referenced by absolute path. NOTE: a GIF is binary and this patch is a plain
+unified diff applied with `patch -p1`, which cannot carry binary files, so
+spinner.gif ships as a build-dir asset installed separately (the
+update_installed_refractasnapshot.sh deploy script, and the "copy the
+pre-patched binaries" path, both install it). If it is absent, working_start
+falls back to a text-only dialog.
 
 ---
 --- a/usr/bin/refractasnapshot-gui
 +++ b/usr/bin/refractasnapshot-gui
-@@ -5,6 +5,67 @@
+@@ -5,6 +5,103 @@
  TEXTDOMAIN=refractasnapshot-gui
  TEXTDOMAINDIR=/usr/share/locale/
  
@@ -71,6 +67,42 @@ What changes (v4):
 +# --- window / dialog icon (custom) ---
 +REFRACTA_ICON="/usr/share/icons/hicolor/scalable/apps/refractasnapshot.svg"
 +
++# --- "please wait, working..." dialog with a turning cog ----------------------
++# Long steps used to show a pulsating yad progress bar stuck at "0%" (the real
++# work happens in the background, so the percentage was always meaningless and
++# looked broken). Instead we show a small dialog with an animated turning cog and
++# a plain "Please wait, working..." message. working_start opens it in the
++# background; working_stop closes it. Best-effort: if the spinner image is
++# missing yad simply shows the text, and working_stop with no prior start (or an
++# already-closed dialog) is a harmless no-op.
++#
++# NOTE: yad only ANIMATES a GIF in its --picture dialog; its --image (left/top
++# dialog image) shows a single static frame. So the cog uses --picture, which
++# still renders --text above the picture. --size=orig keeps the cog at its
++# native size.
++REFRACTA_SPINNER="/usr/share/refractasnapshot/spinner.gif"
++REFRACTA_WORK_PID=""
++working_start () {  # $1 = step label (shown in the title bar)
++	if [ -f "$REFRACTA_SPINNER" ] ; then
++		$DIALOG --picture --filename="$REFRACTA_SPINNER" --size=orig \
++			--title="$1" ${CENTER} --text-align=center \
++			--text=$"\nPlease wait, working...\n" \
++			--no-buttons --skip-taskbar --width=360 &
++	else
++		$DIALOG --title="$1" ${CENTER} --text-align=center \
++			--text=$"\nPlease wait, working...\n" \
++			--no-buttons --skip-taskbar --width=360 &
++	fi
++	REFRACTA_WORK_PID=$!
++}
++working_stop () {
++	if [ -n "$REFRACTA_WORK_PID" ] ; then
++		kill "$REFRACTA_WORK_PID" 2>/dev/null || true
++		wait "$REFRACTA_WORK_PID" 2>/dev/null || true
++		REFRACTA_WORK_PID=""
++	fi
++}
++
 +# --- total elapsed-time reporting (purely cosmetic) ---
 +# Record when the script started so the final "all done" dialog can report how
 +# long the whole run took - every dialog and copy, from launch to finish. Best-
@@ -98,7 +130,7 @@ What changes (v4):
  # Copyright: fsmithred@gmail.com 2011-2023
  # based on refractasnapshot-8.0.4 by Dean Linkous
  # Some (much) code contributed by David Hare.
-@@ -94,7 +155,7 @@
+@@ -94,7 +191,7 @@
  # if yad is installed, use in preference
  if [[ -f /usr/bin/yad ]]; then
  
@@ -107,7 +139,7 @@ What changes (v4):
  	INFO="image=gtk-dialog-info"
  	QUESTION="image=gtk-dialog-question"
  	WARNING="image=gtk-dialog-warning"
-@@ -109,7 +170,7 @@
+@@ -109,7 +206,7 @@
  
  else
  
@@ -116,7 +148,7 @@ What changes (v4):
    Yad is not installed. You can't run the GUI version of
    Refracta Snapshot without it. Instead, you can run
    'refractasnapshot' from a terminal or console for the CLI version.
-@@ -125,6 +186,13 @@
+@@ -125,6 +222,13 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -130,7 +162,7 @@ What changes (v4):
  
  ######## FUNCTIONS
  
-@@ -160,7 +228,7 @@
+@@ -160,7 +264,7 @@
  
  show_snapshot_help () {
  
@@ -139,7 +171,18 @@ What changes (v4):
  	--button=$"Close":0 &
  	sleep 2
  	choose_task
-@@ -565,37 +633,29 @@
+@@ -240,7 +344,9 @@
+ 	if [ $? -eq 0 ]; then
+ 		find_editor
+ 		"$editor" "${editor_option}" "$target_file"
+-		update-initramfs -u | tee >($DIALOG --title=$"Running update-initramfs..." ${CENTER} --progress --pulsate --auto-close --width 300)
++		working_start $"Running update-initramfs..."
++		update-initramfs -u
++		working_stop
+ 	fi
+ fi
+ 
+@@ -565,37 +671,31 @@
  }
  
  
@@ -174,12 +217,14 @@ What changes (v4):
 +		echo "Note: skel-seed-lib.sh not found; skipping /etc/skel seeding."
 +		return 0
 +	fi
-+	local _home
++	local _home _seed_rc
 +	_home=$(refracta_skel_source_home)
 +	echo "Seeding /etc/skel from ${_home:-<unknown user home>}"
-+	refracta_seed_skel "$_home" 2>&1 \
-+		| tee >($DIALOG --title=$"Seeding /etc/skel from your desktop..." ${CENTER} --progress --pulsate --auto-close --width 400)
-+	if [[ ${PIPESTATUS[0]} -ne 0 ]] ; then
++	working_start $"Seeding /etc/skel from your desktop..."
++	refracta_seed_skel "$_home" 2>&1
++	_seed_rc=$?
++	working_stop
++	if [[ $_seed_rc -ne 0 ]] ; then
 +		$DIALOG --$WARNING --title="Refracta Snapshot" ${CENTER} --${BUTTON0}=$"Continue"${BUTTON0NUM} \
 +			--text=$"Warning: seeding /etc/skel did not fully succeed.
 +Continuing with the snapshot."
@@ -198,7 +243,7 @@ What changes (v4):
  
  	please_wait
  	check_copies
-@@ -605,11 +665,17 @@
+@@ -605,11 +705,17 @@
  		check_initrd
  	fi
  	kill "$wait_pid"
@@ -217,7 +262,7 @@ What changes (v4):
  	if [[ $initrd_crypt = "yes" ]] ; then
  		prepare_initrd_crypt
  	fi
-@@ -624,23 +690,69 @@
+@@ -624,23 +730,69 @@
  	fi
  	edit_system
  	get_filename
@@ -292,7 +337,7 @@ What changes (v4):
  	exit 0
  fi
  
-@@ -768,10 +880,12 @@
+@@ -768,10 +920,12 @@
  		DISTRO="Refracta"
  	fi
  
@@ -305,19 +350,68 @@ What changes (v4):
  
  	if [[ -z "$DISTRO" ]] ; then
  		DISTRO="GNU/Linux `uname -r`"
-@@ -1285,7 +1399,8 @@
+@@ -840,7 +994,9 @@
+ 
+ # update the mlocate database 
+ if [[ $update_mlocate = "yes" ]]; then
+-	updatedb | tee >($DIALOG --title=$"Running updatedb..." ${CENTER} --progress --pulsate --auto-close --width 300)
++	working_start $"Running updatedb..."
++	updatedb
++	working_stop
+ fi
+ 
+ }
+@@ -921,9 +1077,10 @@
+ 		cpulimit -e rsync -l "$limit" &
+ 		pid="$!"
+ 	fi
++	working_start $"Copying filesystem..."
+ 	rsync -avX / myfs/ ${rsync_option1} ${rsync_option2} ${rsync_option3} \
+-		--exclude="$work_dir" --exclude="$snapshot_dir" --exclude="$efi_work" --exclude-from="$snapshot_excludes" \
+-	 | tee >($DIALOG --title=$"Copying filesystem..." ${CENTER} --progress --pulsate --auto-close --width 300)
++		--exclude="$work_dir" --exclude="$snapshot_dir" --exclude="$efi_work" --exclude-from="$snapshot_excludes"
++	working_stop
+ 	if [[ -n "$pid" ]] ; then
+ 		kill "$pid"
+ 	fi
+@@ -1256,10 +1413,11 @@
+ 
+ [[ -n "$volid" ]] || volid="liveiso"
+ 
++    working_start $"Creating CD/DVD image file..."
+     xorriso -as mkisofs -r -J -joliet-long -l -iso-level 3 ${isohybrid_opt} \
+     -partition_offset 16 -V "$volid"  -b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot \
+-    -boot-load-size 4 -boot-info-table ${uefi_opt} -o "$snapshot_dir"/"$filename" iso/ \
+-    | tee >($DIALOG --title=$"Creating CD/DVD image file..." ${CENTER} --progress --pulsate --auto-close --width 300)
++    -boot-load-size 4 -boot-info-table ${uefi_opt} -o "$snapshot_dir"/"$filename" iso/
++    working_stop
+ 
+ 	if [[ $make_sha256sum = "yes" ]]; then
+ 		cd "$snapshot_dir"
+@@ -1274,7 +1432,9 @@
+ 
+ if [[ $save_work = "no" ]]; then
+     cd /
+-    rm -rf "$work_dir" | tee >($DIALOG --title=$"Cleaning..." ${CENTER} --progress --pulsate --auto-close)
++    working_start $"Cleaning..."
++    rm -rf "$work_dir"
++    working_stop
+     rm -rf /tmp/extracted
+ # Don't need this if noappend is used with mksquashfs
+ #else
+@@ -1285,7 +1445,8 @@
  
  final_message () {
  
 -$DIALOG --$INFO --title="Refracta Snapshot" ${CENTER} --text=$"All finished! " --width 320 --${BUTTON0}=$"OK"${BUTTON0NUM}
 +_elapsed_msg="$(refracta_elapsed_sentence)"
-+$DIALOG --image="$REFRACTA_ICON" --title="Refracta Snapshot" ${CENTER} --text=$"All finished! \n\n $_elapsed_msg" --width 400 --${BUTTON0}=$"OK"${BUTTON0NUM}
++$DIALOG --image="$REFRACTA_ICON" --title="Refracta Snapshot" ${CENTER} --text=$"All finished! \n\n Your ISO is complete at $snapshot_dir \n\n $_elapsed_msg" --width 500 --${BUTTON0}=$"OK"${BUTTON0NUM}
  
  }
  
 --- a/usr/bin/refractasnapshot-wrapper.sh
 +++ b/usr/bin/refractasnapshot-wrapper.sh
-@@ -4,6 +4,40 @@
+@@ -4,6 +4,59 @@
  
  command="/usr/bin/refractasnapshot-gui"
  
@@ -355,18 +449,43 @@ What changes (v4):
 +}
 +XTC="$(refracta_xterm_theme)"
 +
++# --- welcome banner shown in the xterm before the password prompt ---
++# Printed inside the xterm right before sudo/su asks for a password, so the
++# prompt no longer appears "out of the blue". The final line (which password to
++# type) is only added when a password is actually required; pass "none" to omit
++# it. Never errors and never blocks.
++refracta_welcome_banner() {  # $1 = auth hint: sudo | root | none
++	printf '%s\n' \
++		'' \
++		'  Welcome to Refracta Snapshot.' \
++		'' \
++		'  This program will collect your running operating system into an ISO' \
++		'  file ready to be deployed on the next machine.' \
++		''
++	case "$1" in
++		sudo) printf '%s\n' '  To continue, please enter your sudo password.' ;;
++		root) printf '%s\n' '  To continue, please enter the root password.' ;;
++	esac
++}
++
  # I hope nobody uses this, but it's here
  # in case you're running a root xsession.
  if [[ $(id -u) -eq 0 ]] ; then
-@@ -36,9 +70,9 @@
+@@ -36,9 +89,15 @@
  elif
  	# for sudo with password
  	$(groups $USER | grep -qs sudo); then
 -	xterm -fa mono -fs 12 -e  "sudo $command" 
-+	xterm $XTC -fa mono -fs 12 -e  "sudo $command" 
++	# Only claim a password is needed if sudo would actually ask for one.
++	if sudo -n true 2>/dev/null ; then _auth=none ; else _auth=sudo ; fi
++	REFRACTA_BANNER="$(refracta_welcome_banner "$_auth")"
++	export REFRACTA_BANNER command
++	xterm $XTC -fa mono -fs 12 -e bash -c 'printf "%s\n\n" "$REFRACTA_BANNER"; exec sudo "$command"'
  else
 -	xterm -fa mono -fs 12 -e su -c "$command"
-+	xterm $XTC -fa mono -fs 12 -e su -c "$command"
++	REFRACTA_BANNER="$(refracta_welcome_banner root)"
++	export REFRACTA_BANNER command
++	xterm $XTC -fa mono -fs 12 -e bash -c 'printf "%s\n\n" "$REFRACTA_BANNER"; exec su -c "$command"'
  fi
  
  exit 0
