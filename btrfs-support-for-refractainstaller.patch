@@ -1,37 +1,23 @@
 From: Refracta user
-Date: 2026-07-15
-Subject: [PATCH v19] GUI installer: turning-cog "please wait, working..." dialog (replaces the 0% bar)
+Date: 2026-07-28
+Subject: [PATCH v20] GUI installer: fix false "not blank" disk from stale udev PTTYPE/FSTYPE cache
 
-Building on v1..v18. This v19 is cosmetic-only: the long steps (the rsync copies
-to /target, /home and /boot, the swap-file creation, and cleanup) no longer show
-a pulsating yad progress bar stuck at "0%" (the real work runs in the
-background, so the percentage was always meaningless and looked broken). Instead
-they show a small dialog with an animated turning cog and a plain "Please wait,
-working..." message - the same treatment as refractasnapshot v6-v8.
+Building on v1..v19. This v20 fixes a real-hardware bug in the automated-mode
+blank-disk check: _disk_is_blank() rejected a genuinely-blank NVMe disk because
+`lsblk -no PTTYPE/FSTYPE` report from udev's CACHE, which stays STALE after a
+disk is wiped in the same live session (VMs rarely hit this; real hardware does).
+The fix drops the two udev-cache lsblk rejections and lets the fresh root-level
+`blkid -p` probe be the sole signature authority - it catches filesystem
+superblocks AND partition tables (incl. a backup GPT) from a live probe of the
+media. The child-partition guard (`lsblk -nr -o NAME`, read from /sys) is kept.
 
-  refractainstaller-yad: a working_start "<label>" / working_stop helper pair
-    opens a backgrounded yad --picture dialog (animated cog) and closes it when
-    the step finishes. It replaces the `cmd | tee >(yad --progress --pulsate)`
-    idiom in all five long steps. It calls `command yad` directly (bypassing the
-    v11 yad() logging wrapper) so $! is the real yad PID and working_stop can
-    kill it cleanly; it adds --window-icon explicitly and writes its own
-    WORKING open/close lines to the install log.
-
-The cog is an animated GIF installed to /usr/share/refractainstaller/spinner.gif,
-referenced by absolute path. NOTE: yad only ANIMATES a GIF in its --picture
-dialog (its --image shows a single static frame), and a GIF is binary while this
-patch is a plain unified diff applied with `patch -p1`, which cannot carry
-binary files. spinner.gif therefore ships as a build-dir asset installed
-separately (the update_installed_refractainstaller.sh deploy script, and the
-"copy the pre-patched binaries" path, both install it). If it is absent,
-working_start falls back to a text-only dialog.
-
-What changes (v19):
-  - refractainstaller-yad: define REFRACTA_SPINNER + working_start/working_stop;
-    replace the five pulsate progress dialogs with the spinner dialog.
-  - NEW (binary, NOT in this patch) usr/share/refractainstaller/spinner.gif.
+What changes (v20):
+  - refractainstaller-yad: _disk_is_blank() drops the `lsblk -no PTTYPE` and
+    `lsblk -no FSTYPE` rejections; `blkid -p` is the sole media-signature check;
+    explanatory comments added.
   - refractainstaller-wrapper.sh, refractainstaller (CLI), btrfs-disk-lib.sh,
-    refractainstaller.desktop and refractainstaller.svg: unchanged from v18.
+    refractainstaller.desktop, refractainstaller.svg and spinner.gif: unchanged
+    from v19.
 
 ---
 --- a/usr/bin/refractainstaller-yad
@@ -354,7 +340,7 @@ What changes (v19):
  # Greeting window
  yad --title="$window_title" --width=540 --height=500 --center --borders=10 \
  	--button=$"Continue":0 --button=$"Exit":1 \
-@@ -179,6 +462,134 @@
+@@ -179,6 +462,137 @@
  # Fix root's path (for Buster/Beowulf and later)
  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
  
@@ -375,9 +361,12 @@ What changes (v19):
 +_disk_is_blank () {
 +	local _d="$1"
 +	[[ -b "$_d" ]] || return 1
++	# A real child-partition device is authoritative (from /sys, never cached).
 +	[[ -n "$(lsblk -nr -o NAME "$_d" 2>/dev/null | tail -n +2)" ]] && return 1
-+	[[ -n "$(lsblk -no PTTYPE "$_d" 2>/dev/null | tr -d '[:space:]')" ]] && return 1
-+	[[ -n "$(lsblk -no FSTYPE "$_d" 2>/dev/null | tr -d '[:space:]')" ]] && return 1
++	# NOTE: lsblk's PTTYPE/FSTYPE come from udev's cache, which stays STALE after a
++	# disk is wiped in the same live session (bites on real hardware; VMs rarely do).
++	# A fresh root-level probe is the authority: blkid -p reports any filesystem or
++	# partition-table signature actually present on the media right now.
 +	blkid -p "$_d" >/dev/null 2>&1 && return 1
 +	return 0
 +}
@@ -489,7 +478,7 @@ What changes (v19):
  # function to exit the script if there are errors
  check_exit () {
  exit_code="$?"
-@@ -331,6 +742,9 @@
+@@ -331,6 +745,9 @@
  "
  	fi
  
@@ -499,7 +488,7 @@ What changes (v19):
  	yad --title=$"$window_title" --width=480 --button=$"Help":0 \
  	--button=$"Continue":1 --button=$"Exit":2 --center --borders=10 \
  	--text=$"
-@@ -341,11 +755,12 @@
+@@ -341,11 +758,12 @@
  DO NOT FORMAT A PRE-EXISTING EFI PARTITION!!!
  	"
  	answer="$?"
@@ -513,7 +502,7 @@ What changes (v19):
  else
  	# not uefi, do bios install.
  	esp_list=$(env LC_ALL=C fdisk -l | awk '/EFI System/ { print $0 }')
-@@ -430,6 +845,9 @@
+@@ -430,6 +848,9 @@
  fi
  
  
@@ -523,7 +512,7 @@ What changes (v19):
  # Select installation options
  
  opts=$(yad --list --title=$"Installation Options" --center --borders=10 \
-@@ -557,10 +975,73 @@
+@@ -557,10 +978,73 @@
          fi
      fi
      # end test for cryptsetup
@@ -599,7 +588,7 @@ What changes (v19):
  
  
  list_disks () {
-@@ -571,6 +1052,99 @@
+@@ -571,6 +1055,99 @@
  	cat /tmp/diskinfo | yad --text-info --title=Disks --borders=10  --width 550 --height 400 --button="Close":0 && rm -f /tmp/diskinfo &
  }
  
@@ -699,7 +688,7 @@ What changes (v19):
  partition_disk () {
  if [ -n "$gpt_list" ] || [ "$uefi_boot" = yes ] ; then
  	cli_partition_tool="gdisk"
-@@ -578,20 +1152,31 @@
+@@ -578,20 +1155,31 @@
  	cli_partition_tool="cfdisk"
  fi
  
@@ -736,7 +725,7 @@ What changes (v19):
  
  }
  
-@@ -611,8 +1196,16 @@
+@@ -611,8 +1199,16 @@
  fi
  
  
@@ -755,7 +744,7 @@ What changes (v19):
  
  ask_format_efi () {
  
-@@ -778,7 +1371,7 @@
+@@ -778,7 +1374,7 @@
  boot_dev=$(echo $boot_dev | sed -e 's/(null)//')
  }
  
@@ -764,7 +753,7 @@ What changes (v19):
      choose_boot
  fi
  
-@@ -845,16 +1438,20 @@
+@@ -845,16 +1441,20 @@
  fi
  }
  
@@ -788,7 +777,7 @@ What changes (v19):
  if [[ -z $fs_type_os ]]; then
          yad --window-icon=error --title=$"Error" --center --borders=10 --button=$"Go back":0 --button=$"Exit":1 \
        --text=$"You must choose a file system type
-@@ -867,10 +1464,48 @@
+@@ -867,10 +1467,48 @@
  fi  
  }
  
@@ -838,7 +827,7 @@ What changes (v19):
  fi
  
  
-@@ -977,6 +1612,158 @@
+@@ -977,6 +1615,158 @@
  
  
  
@@ -997,7 +986,7 @@ What changes (v19):
  # Show a summary of what will be done
  
  if [[ $grub_dev = "efi" ]] || [[ -n "$grub_package" ]] ; then
-@@ -1162,7 +1949,9 @@
+@@ -1162,7 +1952,9 @@
  fi
  }
  
@@ -1008,7 +997,7 @@ What changes (v19):
  
  
  # Write random data or zeros to OS and /home partitions
-@@ -1251,9 +2040,49 @@
+@@ -1251,9 +2043,49 @@
      install_part="$install_dev"
  fi 
  if [[ $no_format != "yes" ]]; then
@@ -1060,7 +1049,7 @@ What changes (v19):
  
  
  # make mount point for separate home if needed
-@@ -1296,20 +2125,23 @@
+@@ -1296,20 +2128,23 @@
  
  
  # copy everything over except the things listed in the exclude list
@@ -1090,7 +1079,7 @@ What changes (v19):
  fi
  
  #*************************************************************
-@@ -1333,14 +2165,71 @@
+@@ -1333,14 +2168,71 @@
  ln -sv /run/shm /target/dev/shm
  mkdir -v /target/dev/pts
  
@@ -1166,7 +1155,7 @@ What changes (v19):
  fi
  
  
-@@ -1372,6 +2261,16 @@
+@@ -1372,6 +2264,16 @@
          sed -i 's/^AutomaticLogin/#AutomaticLogin/' /target/etc/gdm3/daemon.conf
      fi
  
@@ -1183,7 +1172,7 @@ What changes (v19):
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i 's/^autologin/#autologin/g' /target/etc/lightdm/lightdm.conf
-@@ -1447,6 +2346,16 @@
+@@ -1447,6 +2349,16 @@
          sed -i "/AutomaticLogin/s/$oldusername/$newusername/" /target/etc/gdm3/daemon.conf
      fi
  
@@ -1200,7 +1189,7 @@ What changes (v19):
  	#lightdm
  	if [[ -f /target/etc/lightdm/lightdm.conf ]]; then
  		sed -i "/autologin/s/=$oldusername/=$newusername/" /target/etc/lightdm/lightdm.conf
-@@ -1531,9 +2440,23 @@
+@@ -1531,9 +2443,23 @@
  		install_part="$install_dev"
  	fi
  fi
@@ -1225,7 +1214,7 @@ What changes (v19):
  
  # add entry for /home to fstab if needed
  if ! [[ -z $home_dev ]] ; then
-@@ -1594,10 +2517,12 @@
+@@ -1594,10 +2520,12 @@
  	else
  		swap_part="$swap_dev"
  	fi
@@ -1239,7 +1228,7 @@ What changes (v19):
  fi
  
  
-@@ -1674,13 +2599,28 @@
+@@ -1674,13 +2602,28 @@
  	fi
  	
  	if [[ -n $boot_dev ]] ; then
@@ -1271,7 +1260,7 @@ What changes (v19):
  fi
  
  
-@@ -1690,13 +2630,57 @@
+@@ -1690,13 +2633,57 @@
  
  
   
@@ -1332,7 +1321,7 @@ What changes (v19):
  fi
  
  
-@@ -1765,7 +2749,7 @@
+@@ -1765,7 +2752,7 @@
  
  chroot_terminal () {
  
@@ -1341,7 +1330,7 @@ What changes (v19):
  
  }
  
-@@ -1793,6 +2777,10 @@
+@@ -1793,6 +2780,10 @@
  fi
  
  # Pause to allow manual changes to /target for UEFI boot.
@@ -1352,7 +1341,7 @@ What changes (v19):
  df -h | yad --text-info --title=$"Install Bootloader" --center --borders=10 --width=650 --height=600 \
  	--text=$"${bios_boot_warning}
  ${grub_message}
-@@ -1808,6 +2796,7 @@
+@@ -1808,6 +2799,7 @@
  " \
  "${grub_button}" --button=$"Abort":2 --button=$"Chroot":1 --button=$"Continue":0 
  answer="$?"
@@ -1360,7 +1349,7 @@ What changes (v19):
  
  if [[ $answer = 1 ]] ; then
  	chroot_terminal
-@@ -1836,7 +2825,8 @@
+@@ -1836,7 +2828,8 @@
  #******************************************************************
  
  # Run update-initramfs to include dm-mod if using encryption
@@ -1370,7 +1359,7 @@ What changes (v19):
  	if [[ -f /usr/sbin/update-initramfs.orig.initramfs-tools ]] ; then
  		chroot /target /usr/sbin/update-initramfs.orig.initramfs-tools -u -k all >> "$error_log"
  	else
-@@ -1874,60 +2864,17 @@
+@@ -1874,60 +2867,17 @@
  oldname=$(awk -F: '/1000:1000/ { print $1 }' /target/etc/passwd)
  old_realname=$(cat /target/etc/passwd |grep "^$oldname"|sed "s/,,,//"|awk -F ":" '{print $5}')
  
@@ -1435,7 +1424,7 @@ What changes (v19):
  	sed -i "s/$HOSTNAME/$new_hostname/" /target/etc/hostname
  	sed -i "s/$HOSTNAME/$new_hostname/g" /target/etc/hosts
  fi
-@@ -2053,72 +3000,15 @@
+@@ -2053,72 +3003,15 @@
  
  ## passwords ##
  
@@ -1513,7 +1502,7 @@ What changes (v19):
  
  
  	if [ -n "$newpass" ]; then
-@@ -2133,8 +3023,8 @@
+@@ -2133,8 +3026,8 @@
  # do user password
  set_userpass() {
  
@@ -1524,7 +1513,7 @@ What changes (v19):
  
  	if [ -n "$newpass" ]; then
  		chroot /target /bin/bash -c "echo -e \"$newpass\n$newpass\n\" | passwd $newusername"
-@@ -2164,7 +3054,16 @@
+@@ -2164,7 +3057,16 @@
  fi
  
  
